@@ -1,0 +1,5371 @@
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\server.ts =====
+import mongoose from 'mongoose';
+import compression from 'compression';
+import cookieParser from 'cookie-parser';
+import cors from 'cors';
+import express, { Express, Request, Response } from 'express';
+import helmet from 'helmet';
+import morgan from 'morgan';
+
+import { env } from '@/config/env';
+import { connectRedis, redisClient } from '@/config/redis';
+import { initTypesenseCollections } from '@/config/typesense';
+import { connectDB, closeDB } from '@/database/connectDB';
+import { initIndexes } from '@/database/indexes';
+import { authorizeAdmin } from '@/middleware/admin.middleware';
+import { authenticate } from '@/middleware/auth.middleware';
+import { errorHandler } from '@/middleware/errorHandler';
+import { NotFoundError } from '@/middleware/errorHandler';
+import { globalRateLimiter } from '@/middleware/rateLimiter';
+import { requestIdMiddleware } from '@/middleware/requestId.middleware';
+import { authRouter } from '@/modules/auth/auth.routes';
+import { userRouter } from '@/modules/user/user.routes';
+import { jobsRouter } from '@/modules/jobs/jobs.routes';
+import { companiesRouter } from '@/modules/companies/companies.routes';
+import { alertsRouter } from '@/modules/alerts/alerts.routes';
+import { notificationRouter } from '@/modules/notifications/notification.routes';
+import scraperRouter from '@/modules/scraper/scraper.routes';
+import { initializeScheduler } from '@/scrapers/scheduler';
+import { logger } from '@/utils/logger';
+
+const app: Express = express();
+
+// ────────────────────────────────────────────────
+// Global Middlewares
+// ────────────────────────────────────────────────
+
+// Trust first proxy hop — required for correct req.ip behind Nginx/Cloudflare
+app.set('trust proxy', 1);
+
+// Generate unique request ID for tracing
+app.use(requestIdMiddleware);
+
+// Security HTTP headers
+app.use(helmet());
+
+// CORS configuration matching FRONTEND_URL
+app.use(
+  cors({
+    origin: env.FRONTEND_URL,
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
+
+// Gzip compression
+app.use(compression());
+
+// Body parsers with size limits to prevent large-payload DoS
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+// Cookie parser for reading refresh tokens
+app.use(cookieParser());
+
+// Request logging
+if (env.NODE_ENV !== 'test') {
+  if (env.NODE_ENV === 'production') {
+    app.use(morgan('{"request_id":":req[X-Request-Id]", "method":":method", "url":":url", "status":":status", "time":":response-time ms"}'));
+  } else {
+    app.use(morgan('dev'));
+  }
+}
+
+// Global rate limiting
+app.use(globalRateLimiter);
+
+// ────────────────────────────────────────────────
+// Routes
+// ────────────────────────────────────────────────
+
+// Health Check
+app.get('/health', async (_req: Request, res: Response) => {
+  const dbStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
+  const redisStatus = redisClient?.status === 'ready' ? 'connected' : 'disconnected';
+  
+  res.status(200).json({
+    status: dbStatus === 'connected' && redisStatus === 'connected' ? 'ok' : 'degraded',
+    timestamp: new Date(),
+    uptime: process.uptime(),
+    version: process.env.npm_package_version || '1.0.0',
+    services: {
+      mongodb: dbStatus,
+      redis: redisStatus
+    }
+  });
+});
+
+const API_PREFIX = '/api/v1';
+
+// Auth Routes
+app.use(`${API_PREFIX}/auth`, authRouter);
+
+// User Profile Routes
+app.use(`${API_PREFIX}/users`, userRouter);
+
+// Jobs Routes
+app.use(`${API_PREFIX}/jobs`, jobsRouter);
+
+// Companies Routes
+app.use(`${API_PREFIX}/companies`, companiesRouter);
+
+// Alerts Routes
+app.use(`${API_PREFIX}/alerts`, alertsRouter);
+
+// Notification Routes
+app.use(`${API_PREFIX}/notifications`, notificationRouter);
+
+// Scraper Routes
+app.use(`/api/scrape`, scraperRouter);
+
+
+// Mount test routes during testing
+if (env.NODE_ENV === 'test') {
+  app.get(`${API_PREFIX}/test-admin-only`, authenticate, authorizeAdmin, (_req: Request, res: Response) => {
+    res.status(200).json({ success: true, message: 'Welcome Admin!' });
+  });
+}
+
+// 404 handler for unknown routes
+app.use((_req: Request, _res: Response, next) => {
+  next(new NotFoundError('Route'));
+});
+
+// Global Error Handler
+app.use(errorHandler);
+
+// ────────────────────────────────────────────────
+// Server Initialization
+// ────────────────────────────────────────────────
+
+const PORT = env.PORT || 3000;
+let server: any;
+
+async function startServer(): Promise<void> {
+  try {
+    // 1. Connect to MongoDB
+    await connectDB();
+
+    // 2. Synchronize database indexes
+    await initIndexes();
+
+    // 3. Initialize Redis connection gracefully (defensive check)
+    try {
+      await connectRedis();
+      logger.info('✅ Redis connection initialized successfully');
+    } catch (err: any) {
+      logger.warn(`⚠️  Failed to connect to Redis: ${err.message}`);
+    }
+
+    // 4. Initialize Typesense collections gracefully (defensive check)
+    try {
+      await initTypesenseCollections();
+      logger.info('✅ Typesense collection verified successfully');
+    } catch (err: any) {
+      logger.warn(`⚠️  Failed to initialize Typesense: ${err.message}`);
+    }
+
+    // 5. Start listening
+    if (env.NODE_ENV !== 'test') {
+      initializeScheduler();
+      server = app.listen(PORT, () => {
+        logger.info(`🚀 Server running in ${env.NODE_ENV} mode on port ${PORT}`);
+      });
+      
+      // Graceful shutdown handling
+      const gracefulShutdown = async (signal: string) => {
+        logger.warn(`Received ${signal}. Starting graceful shutdown...`);
+        if (server) {
+          server.close(() => {
+            logger.info('HTTP server closed.');
+          });
+        }
+        await closeDB();
+        if (redisClient) {
+          await redisClient.quit();
+          logger.info('Redis connection closed.');
+        }
+        process.exit(0);
+      };
+
+      process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+      process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    }
+  } catch (error) {
+    logger.error('❌ Failed to start the server:', error);
+    process.exit(1);
+  }
+}
+
+// Start only if this file is run directly (not imported as a module in tests)
+if (require.main === module) {
+  startServer();
+}
+
+export { app, startServer };
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\config\bullmq.ts =====
+import { Queue, QueueOptions } from 'bullmq';
+
+import { getRedisClient } from './redis';
+
+const defaultQueueOptions: Partial<QueueOptions> = {
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: {
+      type: 'exponential',
+      delay: 1000,
+    },
+    removeOnComplete: {
+      age: 3600, // 1 hour
+      count: 100,
+    },
+    removeOnFail: {
+      age: 24 * 3600, // 24 hours
+    },
+  },
+};
+
+function createQueue(name: string, options?: Partial<QueueOptions>): Queue {
+  return new Queue(name, {
+    connection: getRedisClient() as any,
+    ...defaultQueueOptions,
+    ...options,
+  });
+}
+
+// ────────────────────────────────────────────────
+// Queue instances
+// ────────────────────────────────────────────────
+
+export const QUEUE_NAMES = {
+  JOB_SCRAPER: 'job-scraper',
+  JOB_INDEXER: 'job-indexer',
+  NOTIFICATIONS: 'notifications',
+  ALERTS: 'alerts',
+  EMAIL: 'email',
+  CLASSIFICATION: 'classificationQueue',
+} as const;
+
+export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
+
+export const jobScraperQueue = createQueue(QUEUE_NAMES.JOB_SCRAPER);
+export const jobIndexerQueue = createQueue(QUEUE_NAMES.JOB_INDEXER);
+export const notificationsQueue = createQueue(QUEUE_NAMES.NOTIFICATIONS, {
+  defaultJobOptions: {
+    attempts: 5,
+    backoff: { type: 'exponential', delay: 2000 },
+  },
+});
+export const alertsQueue = createQueue(QUEUE_NAMES.ALERTS);
+export const emailQueue = createQueue(QUEUE_NAMES.EMAIL);
+export const classificationQueue = createQueue(QUEUE_NAMES.CLASSIFICATION, {
+  defaultJobOptions: {
+    attempts: 5, // more attempts for AI rate limits
+    backoff: { type: 'exponential', delay: 3000 },
+  },
+});
+
+export const allQueues = [
+  jobScraperQueue,
+  jobIndexerQueue,
+  notificationsQueue,
+  alertsQueue,
+  emailQueue,
+  classificationQueue,
+];
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\config\env.ts =====
+import dotenv from 'dotenv';
+import { z } from 'zod';
+
+dotenv.config();
+
+const envSchema = z.object({
+  // Server
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  PORT: z.coerce.number().default(3000),
+  API_PREFIX: z.string().default('/api/v1'),
+
+  // MongoDB
+  MONGODB_URI: z.string().url('MONGODB_URI must be a valid URL'),
+
+  // JWT
+  JWT_ACCESS_SECRET: z.string().min(32, 'JWT_ACCESS_SECRET must be at least 32 characters'),
+  JWT_REFRESH_SECRET: z.string().min(32, 'JWT_REFRESH_SECRET must be at least 32 characters'),
+  JWT_ACCESS_EXPIRES: z.string().default('15m'),
+  JWT_REFRESH_EXPIRES: z.string().default('30d'),
+
+  // Google OAuth
+  GOOGLE_CLIENT_ID: z.string().min(1).optional(),
+  GOOGLE_CLIENT_SECRET: z.string().min(1).optional(),
+  GOOGLE_CALLBACK_URL: z.string().url().optional(),
+
+  // Redis
+  REDIS_URL: z.string().url('REDIS_URL must be a valid URL'),
+
+  // Typesense
+  TYPESENSE_HOST: z.string().default('localhost'),
+  TYPESENSE_PORT: z.coerce.number().default(8108),
+  TYPESENSE_PROTOCOL: z.enum(['http', 'https']).default('http'),
+  TYPESENSE_API_KEY: z.string().min(1),
+
+  // Frontend URL
+  FRONTEND_URL: z.string().url().default('http://localhost:5173'),
+
+  // Resend
+  RESEND_API_KEY: z.string().min(1).optional(),
+  RESEND_FROM_EMAIL: z.string().email().optional(),
+
+  // Telegram
+  TELEGRAM_BOT_TOKEN: z.string().optional(),
+
+  // Discord
+  DISCORD_WEBHOOK_URL: z.string().url().optional(),
+
+  // Rate limiting
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().default(900000),
+  RATE_LIMIT_MAX_REQUESTS: z.coerce.number().default(100),
+
+  // Logging
+  LOG_LEVEL: z.string().default('info'),
+});
+
+const parsed = envSchema.safeParse(process.env);
+
+if (!parsed.success) {
+  console.error('❌ Invalid environment variables:');
+  const errors = parsed.error.flatten().fieldErrors;
+  Object.entries(errors).forEach(([field, messages]) => {
+    console.error(`  ${field}: ${messages?.join(', ')}`);
+  });
+  process.exit(1);
+}
+
+export const env = parsed.data;
+export type Env = z.infer<typeof envSchema>;
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\config\redis.ts =====
+import Redis from 'ioredis';
+
+import { logger } from '@/utils/logger';
+
+import { env } from './env';
+
+export let redisClient: Redis | null = null;
+
+function createRedisClient(): Redis {
+  const client = new Redis(env.REDIS_URL, {
+    maxRetriesPerRequest: null, // required by BullMQ
+    enableReadyCheck: false,
+    lazyConnect: true,
+    reconnectOnError: (err) => {
+      logger.error('Redis connection error:', err.message);
+      return true;
+    },
+    retryStrategy: (times) => {
+      const delay = Math.min(times * 50, 2000);
+      logger.warn(`Redis reconnecting in ${delay}ms (attempt ${times})`);
+      return delay;
+    },
+  });
+
+  client.on('connect', () => logger.info('✅ Redis connected'));
+  client.on('ready', () => logger.info('✅ Redis ready'));
+  client.on('error', (err) => logger.error('Redis error:', err.message));
+  client.on('close', () => logger.warn('⚠️  Redis connection closed'));
+  client.on('reconnecting', () => logger.info('Redis reconnecting...'));
+
+  return client;
+}
+
+export function getRedisClient(): Redis {
+  if (!redisClient) {
+    redisClient = createRedisClient();
+  }
+  return redisClient;
+}
+
+export async function connectRedis(): Promise<void> {
+  const client = getRedisClient();
+  await client.connect();
+}
+
+export async function disconnectRedis(): Promise<void> {
+  if (redisClient) {
+    await redisClient.quit();
+    redisClient = null;
+    logger.info('Redis disconnected');
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\config\typesense.ts =====
+import Typesense from 'typesense';
+
+import { logger } from '@/utils/logger';
+
+import { env } from './env';
+
+export const typesenseClient = new Typesense.Client({
+  nodes: [
+    {
+      host: env.TYPESENSE_HOST,
+      port: env.TYPESENSE_PORT,
+      protocol: env.TYPESENSE_PROTOCOL,
+    },
+  ],
+  apiKey: env.TYPESENSE_API_KEY,
+  connectionTimeoutSeconds: 10,
+  retryIntervalSeconds: 0.1,
+  healthcheckIntervalSeconds: 60,
+  numRetries: 3,
+});
+
+// ────────────────────────────────────────────────
+// Schema definitions
+// ────────────────────────────────────────────────
+
+export const JOB_COLLECTION_NAME = 'jobs';
+
+export const jobCollectionSchema = {
+  name: JOB_COLLECTION_NAME,
+  fields: [
+    { name: 'id', type: 'string' as const },
+    { name: 'title', type: 'string' as const, infix: true },
+    { name: 'company', type: 'string' as const, facet: true },
+    { name: 'location', type: 'string' as const, facet: true },
+    { name: 'jobType', type: 'string' as const, facet: true },
+    { name: 'salary', type: 'string' as const, optional: true },
+    { name: 'salaryMin', type: 'int32' as const, optional: true, facet: true },
+    { name: 'salaryMax', type: 'int32' as const, optional: true, facet: true },
+    { name: 'description', type: 'string' as const },
+    { name: 'skills', type: 'string[]' as const, facet: true },
+    { name: 'category', type: 'string' as const, facet: true },
+    { name: 'experienceLevel', type: 'string' as const, facet: true },
+    { name: 'remote', type: 'bool' as const, facet: true },
+    { name: 'postedAt', type: 'int64' as const },
+    { name: 'source', type: 'string' as const, facet: true },
+    { name: 'isActive', type: 'bool' as const },
+  ],
+  default_sorting_field: 'postedAt',
+};
+
+export async function initTypesenseCollections(): Promise<void> {
+  try {
+    await typesenseClient.collections(JOB_COLLECTION_NAME).retrieve();
+    logger.info('✅ Typesense collection already exists');
+  } catch {
+    // Collection doesn't exist, create it
+    await typesenseClient.collections().create(jobCollectionSchema);
+    logger.info('✅ Typesense collection created');
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\database\connectDB.ts =====
+import mongoose from 'mongoose';
+
+import { env } from '@/config/env';
+import { logger } from '@/utils/logger';
+
+const MAX_RETRIES = 5;
+const RETRY_INTERVAL_MS = 5000;
+let retryCount = 0;
+
+export async function connectDB(): Promise<void> {
+  mongoose.set('strictQuery', true);
+
+  // Set up event listeners
+  mongoose.connection.on('connected', () => {
+    logger.info('✅ MongoDB Atlas connected successfully');
+    retryCount = 0; // reset retry count on successful connection
+  });
+
+  mongoose.connection.on('error', (err) => {
+    logger.error('❌ MongoDB connection error:', err);
+  });
+
+  mongoose.connection.on('disconnected', () => {
+    logger.warn('⚠️ MongoDB connection disconnected');
+  });
+
+  // Connection function with retry logic
+  const attemptConnection = async () => {
+    try {
+      await mongoose.connect(env.MONGODB_URI, {
+        serverSelectionTimeoutMS: 10000,
+        connectTimeoutMS: 10000,
+        socketTimeoutMS: 45000,
+        maxPoolSize: 10,
+        minPoolSize: 5,
+      });
+    } catch (error) {
+      retryCount++;
+      logger.error(`MongoDB connection failed (attempt ${retryCount}/${MAX_RETRIES}):`, error);
+
+      if (retryCount < MAX_RETRIES) {
+        logger.info(`Retrying connection in ${RETRY_INTERVAL_MS / 1000}s...`);
+        setTimeout(attemptConnection, RETRY_INTERVAL_MS);
+      } else {
+        logger.error('❌ Max MongoDB connection retries reached.');
+        // In test environments, throw instead of killing the process
+        if (env.NODE_ENV === 'test') {
+          throw new Error('Max MongoDB connection retries reached');
+        }
+        process.exit(1);
+      }
+    }
+  };
+
+  await attemptConnection();
+}
+
+// Graceful shutdown handling
+export async function closeDB(): Promise<void> {
+  if (mongoose.connection.readyState !== 0) {
+    try {
+      await mongoose.connection.close();
+      logger.info('MongoDB connection closed gracefully');
+    } catch (error) {
+      logger.error('Error closing MongoDB connection:', error);
+    }
+  }
+}
+
+
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\database\indexes.ts =====
+import mongoose from 'mongoose';
+
+import '@/models/Alert.model';
+import '@/models/AuditLog.model';
+import '@/models/Company.model';
+import '@/models/Job.model';
+import '@/models/Notification.model';
+import '@/models/SavedJob.model';
+import '@/models/ScrapeLog.model';
+// Import all models to ensure they are registered in Mongoose
+import '@/models/User.model';
+import { logger } from '@/utils/logger';
+
+/**
+ * Automatically synchronizes indexes defined in Mongoose schemas with MongoDB.
+ */
+export async function initIndexes(): Promise<void> {
+  const modelNames = Object.keys(mongoose.models);
+  logger.info(`🔄 Synchronizing indexes for ${modelNames.length} registered models...`);
+
+  for (const modelName of modelNames) {
+    const model = mongoose.models[modelName];
+    try {
+      // syncIndexes drops indexes no longer in the schema and creates new ones
+      await model.syncIndexes();
+      logger.info(`✅ Indexes synced successfully for model: ${modelName}`);
+    } catch (error) {
+      logger.error(`❌ Failed to sync indexes for model: ${modelName}`, error);
+    }
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\middleware\admin.middleware.ts =====
+import { NextFunction, Request, Response } from 'express';
+
+import { ForbiddenError, UnauthorizedError } from '@/middleware/errorHandler';
+
+/**
+ * Authorization middleware that allows access only to users with the 'admin' role.
+ */
+export function authorizeAdmin(req: Request, _res: Response, next: NextFunction): void {
+  if (!req.user) {
+    next(new UnauthorizedError('Authentication required'));
+    return;
+  }
+
+  if (req.user.role !== 'admin') {
+    next(new ForbiddenError('Admin access required'));
+    return;
+  }
+
+  next();
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\middleware\auth.middleware.ts =====
+import { NextFunction, Request, Response } from 'express';
+
+import { UnauthorizedError } from '@/middleware/errorHandler';
+import { User } from '@/models/User.model';
+import { JwtPayload, verifyAccessToken } from '@/utils/jwt';
+
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request {
+      user?: JwtPayload;
+    }
+  }
+}
+
+/**
+ * Authentication middleware that verifies JWT Access Tokens.
+ * If validation succeeds, the decoded payload is attached to req.user.
+ */
+export async function authenticate(
+  req: Request,
+  _res: Response,
+  next: NextFunction
+): Promise<void> {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader?.startsWith('Bearer ')) {
+    next(new UnauthorizedError('No token provided'));
+    return;
+  }
+
+  const token = authHeader.split(' ')[1];
+
+  try {
+    const decoded = verifyAccessToken(token);
+
+    // Ensure the user still exists in the database and is active/not deleted
+    const user = await User.findById(decoded.userId).lean();
+    if (!user || !user.isActive || user.isDeleted) {
+      next(new UnauthorizedError('User not found or account is inactive'));
+      return;
+    }
+
+    req.user = decoded;
+    next();
+  } catch (error) {
+    next(new UnauthorizedError('Invalid or expired token'));
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\middleware\errorHandler.ts =====
+import { NextFunction, Request, Response } from 'express';
+import { ZodError } from 'zod';
+
+import { logger } from '@/utils/logger';
+import { sendError } from '@/utils/response';
+
+export class AppError extends Error {
+  public readonly statusCode: number;
+  public readonly isOperational: boolean;
+
+  constructor(message: string, statusCode = 500, isOperational = true) {
+    super(message);
+    this.statusCode = statusCode;
+    this.isOperational = isOperational;
+    Object.setPrototypeOf(this, new.target.prototype);
+    Error.captureStackTrace(this, this.constructor);
+  }
+}
+
+export class NotFoundError extends AppError {
+  constructor(resource = 'Resource') {
+    super(`${resource} not found`, 404);
+  }
+}
+
+export class UnauthorizedError extends AppError {
+  constructor(message = 'Unauthorized') {
+    super(message, 401);
+  }
+}
+
+export class ForbiddenError extends AppError {
+  constructor(message = 'Forbidden') {
+    super(message, 403);
+  }
+}
+
+export class ValidationError extends AppError {
+  constructor(message: string) {
+    super(message, 422);
+  }
+}
+
+export class ConflictError extends AppError {
+  constructor(message: string) {
+    super(message, 409);
+  }
+}
+
+// ────────────────────────────────────────────────
+// Global error handler middleware
+// ────────────────────────────────────────────────
+
+export function errorHandler(
+  err: Error,
+  req: Request,
+  res: Response,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _next: NextFunction
+): void {
+  // Zod validation errors
+  if (err instanceof ZodError) {
+    const message = err.errors.map((e) => `${e.path.join('.')}: ${e.message}`).join('; ');
+    sendError(res, 'Validation failed', 422, message);
+    return;
+  }
+
+  // Known operational errors
+  if (err instanceof AppError) {
+    if (!err.isOperational) {
+      logger.error('Unhandled AppError:', { requestId: req.id, message: err.message, stack: err.stack });
+    }
+    sendError(res, err.message, err.statusCode);
+    return;
+  }
+
+  // Mongoose duplicate key error
+  if ((err as NodeJS.ErrnoException).name === 'MongoServerError') {
+    const mongoErr = err as Error & { code?: number };
+    if (mongoErr.code === 11000) {
+      sendError(res, 'Duplicate entry. Resource already exists.', 409);
+      return;
+    }
+  }
+
+  // Mongoose cast errors (invalid ObjectId)
+  if (err.name === 'CastError') {
+    sendError(res, 'Invalid resource identifier', 400);
+    return;
+  }
+
+  // JWT errors
+  if (err.name === 'JsonWebTokenError') {
+    sendError(res, 'Invalid token', 401);
+    return;
+  }
+
+  if (err.name === 'TokenExpiredError') {
+    sendError(res, 'Token expired', 401);
+    return;
+  }
+
+  // Unhandled errors — don't leak details to client
+  logger.error('Unhandled error:', { requestId: req.id, message: err.message, stack: err.stack, url: req.url });
+  const isDev = process.env.NODE_ENV === 'development';
+  sendError(res, 'Internal server error', 500, isDev ? `${err.message} (ReqID: ${req.id})` : `ReqID: ${req.id}`);
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\middleware\rateLimiter.ts =====
+import rateLimit from 'express-rate-limit';
+
+import { env } from '@/config/env';
+import { sendError } from '@/utils/response';
+
+export const globalRateLimiter = rateLimit({
+  windowMs: env.RATE_LIMIT_WINDOW_MS,
+  max: env.RATE_LIMIT_MAX_REQUESTS,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  handler: (_req, res) => {
+    sendError(res, 'Too many requests. Please try again later.', 429);
+  },
+  skip: (req) => req.ip === '127.0.0.1' && env.NODE_ENV === 'development',
+});
+
+export const authRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: 'Too many auth attempts. Please try again in 15 minutes.',
+  handler: (_req, res) => {
+    sendError(res, 'Too many authentication attempts. Please try again in 15 minutes.', 429);
+  },
+});
+
+export const searchRateLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 60,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  handler: (_req, res) => {
+    sendError(res, 'Too many search requests. Please slow down.', 429);
+  },
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\middleware\requestId.middleware.ts =====
+import crypto from 'crypto';
+
+import { NextFunction, Request, Response } from 'express';
+
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request {
+      id: string;
+    }
+  }
+}
+
+/**
+ * Middleware that assigns a unique request ID to each incoming request.
+ * It uses the 'X-Request-Id' header if present, otherwise generates a new UUIDv4.
+ * The ID is attached to `req.id` and sent back in the `X-Request-Id` response header.
+ */
+export const requestIdMiddleware = (req: Request, res: Response, next: NextFunction): void => {
+  const reqId = req.headers['x-request-id'] || crypto.randomUUID();
+  const idStr = Array.isArray(reqId) ? reqId[0] : reqId;
+
+  req.id = idStr;
+  res.setHeader('X-Request-Id', idStr);
+  next();
+};
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\middleware\validate.middleware.ts =====
+import { NextFunction, Request, Response } from 'express';
+import { AnyZodObject } from 'zod';
+
+/**
+ * Validation middleware that parses req.body, req.query, and req.params using a Zod schema.
+ * Replaces requests data with validated data to benefit from transforms and defaults.
+ * Any parsing errors are passed to the global error handler.
+ */
+export function validate(schema: AnyZodObject) {
+  return async (req: Request, _res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const parsed = await schema.parseAsync({
+        body: req.body,
+        query: req.query,
+        params: req.params,
+      });
+
+      req.body = parsed.body;
+      req.query = parsed.query;
+      req.params = parsed.params;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\models\Alert.model.ts =====
+import { Schema, model } from 'mongoose';
+
+import { IAlertDocument } from '@/types/alert.types';
+
+const alertSchema = new Schema<IAlertDocument>(
+  {
+    userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    company: { type: String, trim: true },
+    department: { type: String, trim: true },
+    location: { type: String, trim: true },
+    industry: { type: String, trim: true },
+    jobCategory: {
+      type: String,
+      enum: ['internship', 'new_grad', 'entry_level', 'co_op', 'rotational'],
+    },
+    channels: {
+      type: [String],
+      enum: ['email', 'telegram', 'discord'],
+      required: true,
+    },
+    isActive: { type: Boolean, default: true, required: true, index: true },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+export const Alert = model<IAlertDocument>('Alert', alertSchema);
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\models\AuditLog.model.ts =====
+import { Document, Schema, Types, model } from 'mongoose';
+
+export interface IAuditLog {
+  userId?: Types.ObjectId;
+  email?: string;
+  action: 'Register' | 'Login' | 'Logout' | 'Refresh Token' | 'Google Login' | 'Profile Update';
+  ipAddress?: string;
+  userAgent?: string;
+  details?: Record<string, any>;
+  timestamp: Date;
+}
+
+export interface IAuditLogDocument extends IAuditLog, Document {}
+
+const auditLogSchema = new Schema<IAuditLogDocument>(
+  {
+    userId: { type: Schema.Types.ObjectId, ref: 'User', index: true },
+    email: { type: String, index: true },
+    action: { type: String, required: true, index: true },
+    ipAddress: { type: String },
+    userAgent: { type: String },
+    details: { type: Schema.Types.Mixed },
+    timestamp: { type: Date, default: Date.now, required: true, index: true },
+  },
+  {
+    timestamps: false,
+  }
+);
+
+export const AuditLog = model<IAuditLogDocument>('AuditLog', auditLogSchema);
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\models\Company.model.ts =====
+import { Schema, model } from 'mongoose';
+
+import { ICompanyDocument } from '@/types/company.types';
+
+const companySchema = new Schema<ICompanyDocument>(
+  {
+    name: { type: String, required: true, trim: true, index: true },
+    domain: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
+      index: true,
+    },
+    logoUrl: { type: String, required: true, trim: true },
+    careerUrl: { type: String, required: true, trim: true },
+    earlyCareerUrl: { type: String, required: true, trim: true },
+    industry: { type: String, required: true, trim: true, index: true },
+    atsPlatform: {
+      type: String,
+      enum: ['greenhouse', 'lever', 'workday', 'icims', 'successfactors', 'ashby', 'custom'],
+      default: 'custom',
+      required: true,
+    },
+    scrapeStrategy: {
+      type: String,
+      enum: ['api', 'playwright', 'static'],
+      default: 'static',
+      required: true,
+    },
+    activeJobCount: { type: Number, default: 0, required: true },
+    lastScrapedAt: { type: Date },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+export const Company = model<ICompanyDocument>('Company', companySchema);
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\models\Job.model.ts =====
+import { Schema, model } from 'mongoose';
+
+import { IJobDocument } from '@/types/job.types';
+
+const jobSchema = new Schema<IJobDocument>(
+  {
+    jobId: { type: String, required: true, trim: true, index: true },
+    jobTitle: { type: String, required: true, trim: true },
+    companyName: { type: String, required: true, trim: true, index: true },
+    companyId: { type: Schema.Types.ObjectId, ref: 'Company', required: true },
+    companyLogoUrl: { type: String, required: true, trim: true },
+    industry: { type: String, required: true, trim: true, index: true },
+    location: { type: String, required: true, trim: true, index: true },
+    country: { type: String, required: true, trim: true },
+    workModel: {
+      type: String,
+      enum: ['remote', 'hybrid', 'onsite'],
+      required: true,
+      index: true,
+    },
+    department: { type: String, required: true, trim: true },
+    jobCategory: {
+      type: String,
+      enum: ['internship', 'new_grad', 'entry_level', 'co_op', 'rotational'],
+      required: true,
+      index: true,
+    },
+    internshipSeason: {
+      type: String,
+      enum: ['summer', 'fall', 'spring', 'year_round'],
+    },
+    applyUrl: { type: String, required: true, trim: true },
+    description: { type: String, required: true },
+    descriptionSnippet: { type: String, required: true, trim: true },
+    sourcePlatform: { type: String, required: true, trim: true },
+    datePosted: { type: Date, index: true },
+    requiresUSWorkAuth: { type: Boolean, default: false },
+    aiClassification: {
+      type: String,
+      enum: ['internship', 'new_grad', 'entry_level', 'co_op', 'rotational', 'experienced'],
+      required: true,
+    },
+    aiConfidence: { type: Number, required: true, min: 0, max: 1 },
+    classificationReason: { type: String, required: true, trim: true },
+    isExpired: { type: Boolean, default: false, required: true, index: true },
+    expiredAt: { type: Date },
+    lastSeen: { type: Date, required: true, default: Date.now },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+// Compound Unique Index: jobId + companyName
+jobSchema.index({ jobId: 1, companyName: 1 }, { unique: true });
+
+export const Job = model<IJobDocument>('Job', jobSchema);
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\models\Notification.model.ts =====
+import { Schema, model } from 'mongoose';
+
+import { INotificationDocument } from '@/types/notification.types';
+
+const notificationSchema = new Schema<INotificationDocument>(
+  {
+    userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    jobId: { type: Schema.Types.ObjectId, ref: 'Job' },
+    channel: {
+      type: String,
+      enum: ['email', 'telegram', 'discord'],
+      required: true,
+    },
+    status: {
+      type: String,
+      enum: ['pending', 'sent', 'failed'],
+      default: 'pending',
+      required: true,
+      index: true,
+    },
+    error: { type: String, trim: true },
+    sentAt: { type: Date },
+    isRead: { type: Boolean, default: false, index: true },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+// Index for createdAt to support querying notification logs chronologically
+notificationSchema.index({ createdAt: -1 });
+
+// Compound unique index to prevent duplicate notifications for the same job and channel to the same user
+notificationSchema.index({ userId: 1, jobId: 1, channel: 1 }, { unique: true });
+
+export const Notification = model<INotificationDocument>('Notification', notificationSchema);
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\models\SavedJob.model.ts =====
+import { Schema, model } from 'mongoose';
+
+import { ISavedJobDocument } from '@/types/job.types';
+
+const savedJobSchema = new Schema<ISavedJobDocument>(
+  {
+    userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    jobId: { type: Schema.Types.ObjectId, ref: 'Job', required: true, index: true },
+    savedAt: { type: Date, default: Date.now, required: true },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+// Compound Unique Index to prevent duplicate saves for the same user and job
+savedJobSchema.index({ userId: 1, jobId: 1 }, { unique: true });
+
+export const SavedJob = model<ISavedJobDocument>('SavedJob', savedJobSchema);
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\models\ScrapeLog.model.ts =====
+import { Schema, model } from 'mongoose';
+
+import { IScrapeLogDocument } from '@/types/company.types';
+
+const scrapeErrorSchema = new Schema(
+  {
+    company: { type: String, required: true, trim: true },
+    error: { type: String, required: true, trim: true },
+  },
+  { _id: false }
+);
+
+const scrapeLogSchema = new Schema<IScrapeLogDocument>(
+  {
+    runId: { type: String, required: true, unique: true, index: true },
+    startedAt: { type: Date, required: true, index: true },
+    finishedAt: { type: Date },
+    companiesAttempted: { type: Number, default: 0, required: true },
+    companiesSucceeded: { type: Number, default: 0, required: true },
+    jobsScraped: { type: Number, default: 0, required: true },
+    jobsAccepted: { type: Number, default: 0, required: true },
+    jobsRejected: { type: Number, default: 0, required: true },
+    errors: [scrapeErrorSchema],
+  },
+  {
+    timestamps: true,
+    suppressReservedKeysWarning: true,
+  }
+);
+
+export const ScrapeLog = model<IScrapeLogDocument>('ScrapeLog', scrapeLogSchema);
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\models\User.model.ts =====
+import bcrypt from 'bcryptjs';
+import { Model, Schema, model } from 'mongoose';
+
+import { IUserDocument } from '@/types/user.types';
+
+export interface IUserModel extends Model<IUserDocument> {
+  // Can define custom statics here if needed
+}
+
+const userSchema = new Schema<IUserDocument, IUserModel>(
+  {
+    name: { type: String, required: true, trim: true },
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
+      index: true,
+    },
+    passwordHash: { type: String, select: false },
+    provider: { type: String, enum: ['local', 'google'], default: 'local', required: true },
+    profileImage: { type: String },
+    telegramChatId: { type: String },
+    discordWebhookUrl: { type: String },
+    role: { type: String, enum: ['user', 'admin'], default: 'user', required: true },
+    isActive: { type: Boolean, default: true, required: true },
+    isDeleted: { type: Boolean, default: false, required: true },
+    deletedAt: { type: Date },
+    lastLoginAt: { type: Date },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+// NOTE: Password hashing is handled exclusively in the service layer (utils/password.ts).
+// Do NOT add a pre-save hook for hashing here — it causes double-hashing bugs.
+
+// Compare password method
+userSchema.methods.comparePassword = async function (candidatePassword: string): Promise<boolean> {
+  if (!this.passwordHash) return false;
+  return bcrypt.compare(candidatePassword, this.passwordHash);
+};
+
+// Soft delete instance method
+userSchema.methods.softDelete = async function (): Promise<IUserDocument> {
+  this.isDeleted = true;
+  this.deletedAt = new Date();
+  return this.save();
+};
+
+// Restore instance method
+userSchema.methods.restore = async function (): Promise<IUserDocument> {
+  this.isDeleted = false;
+  this.deletedAt = undefined;
+  return this.save();
+};
+
+// Global query middleware to exclude soft-deleted records by default
+userSchema.pre(/^find/, function (this: any, next) {
+  const query = this.getQuery();
+  // Allow explicit querying of soft-deleted items if the caller explicitly specifies it
+  if (query.isDeleted === undefined) {
+    this.where({ isDeleted: { $ne: true } });
+  }
+  next();
+});
+
+export const User = model<IUserDocument, IUserModel>('User', userSchema);
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\alerts\alerts.controller.ts =====
+import { Request, Response } from 'express';
+import { AlertsService } from './alerts.service';
+import { asyncHandler } from '@/utils/asyncHandler';
+
+export const createAlert = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.userId;
+  const alert = await AlertsService.createAlert(userId, req.body);
+  res.status(201).json({ success: true, alert });
+});
+
+export const getAlerts = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.userId;
+  const alerts = await AlertsService.getAlerts(userId);
+  res.status(200).json({ success: true, alerts });
+});
+
+export const updateAlert = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.userId;
+  const { alertId } = req.params;
+  const alert = await AlertsService.updateAlert(userId, alertId as string, req.body);
+  res.status(200).json({ success: true, alert });
+});
+
+export const deleteAlert = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.userId;
+  const { alertId } = req.params;
+  await AlertsService.deleteAlert(userId, alertId as string);
+  res.status(200).json({ success: true, message: 'Alert deleted successfully' });
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\alerts\alerts.matcher.ts =====
+import { IJobDocument } from '@/types/job.types';
+import { Alert } from '@/models/Alert.model';
+import { IUserDocument } from '@/types/user.types';
+
+export interface MatchedUser {
+  user: IUserDocument;
+  channels: ('email' | 'telegram' | 'discord')[];
+}
+
+export const matchAlertsForJob = async (job: IJobDocument): Promise<MatchedUser[]> => {
+  const matchedAlerts = await Alert.find({
+    isActive: true,
+    $and: [
+      {
+        $or: [
+          { company: { $exists: false } },
+          { company: null },
+          { company: '' },
+          { company: new RegExp(`^${job.companyName}$`, 'i') }
+        ]
+      },
+      {
+        $or: [
+          { department: { $exists: false } },
+          { department: null },
+          { department: '' },
+          { department: new RegExp(`^${job.department}$`, 'i') }
+        ]
+      },
+      {
+        $or: [
+          { location: { $exists: false } },
+          { location: null },
+          { location: '' },
+          { location: new RegExp(`^${job.location}$`, 'i') }
+        ]
+      },
+      {
+        $or: [
+          { industry: { $exists: false } },
+          { industry: null },
+          { industry: '' },
+          { industry: new RegExp(`^${job.industry}$`, 'i') }
+        ]
+      },
+      {
+        $or: [
+          { jobCategory: { $exists: false } },
+          { jobCategory: null },
+          { jobCategory: job.aiClassification }
+        ]
+      }
+    ]
+  }).populate('userId');
+
+  const result: MatchedUser[] = [];
+  const processedUserIds = new Set<string>();
+
+  for (const alert of matchedAlerts) {
+    // Populate replaces the ObjectId with the actual document
+    const user = alert.userId as unknown as IUserDocument;
+    
+    // Check if user exists and is active
+    if (!user || user.isDeleted || !user.isActive) {
+      continue;
+    }
+
+    const userIdStr = user._id.toString();
+    
+    // Avoid sending multiple notifications to the same user if multiple alerts match
+    if (processedUserIds.has(userIdStr)) {
+      continue;
+    }
+
+    result.push({
+      user,
+      channels: alert.channels,
+    });
+    processedUserIds.add(userIdStr);
+  }
+
+  return result;
+};
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\alerts\alerts.routes.ts =====
+import { Router } from 'express';
+import { createAlert, getAlerts, updateAlert, deleteAlert } from './alerts.controller';
+import { authenticate } from '@/middleware/auth.middleware';
+import { validate } from '@/middleware/validate.middleware';
+import { createAlertSchema, updateAlertSchema } from '@/validators/alert.validator';
+
+const router = Router();
+
+router.use(authenticate);
+
+router.post('/', validate(createAlertSchema), createAlert);
+router.get('/', getAlerts);
+
+// We update param name to match updateAlertSchema expected param 'alertId'
+// Wait, the existing schema expects 'alertId'. Let's rename the param to :alertId
+router.put('/:alertId', validate(updateAlertSchema), updateAlert);
+
+// We need a deleteAlert schema if we strictly want to validate alertId, but we can reuse updateAlertSchema's params for delete.
+// Let's create a minimal validation for delete or update the controller to use req.params.alertId.
+router.delete('/:alertId', deleteAlert);
+
+export { router as alertsRouter };
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\alerts\alerts.service.ts =====
+import { Alert } from '@/models/Alert.model';
+import { NotFoundError } from '@/middleware/errorHandler';
+import { CreateAlertInput, UpdateAlertInput } from '@/validators/alert.validator';
+
+export class AlertsService {
+  static async createAlert(userId: string, data: CreateAlertInput['body']) {
+    const alert = await Alert.create({ userId, ...data });
+    return alert;
+  }
+
+  static async getAlerts(userId: string) {
+    return Alert.find({ userId }).sort({ createdAt: -1 }).lean();
+  }
+
+  static async updateAlert(userId: string, alertId: string, data: UpdateAlertInput['body']) {
+    const alert = await Alert.findOneAndUpdate(
+      { _id: alertId, userId },
+      { $set: data },
+      { new: true, runValidators: true }
+    ).lean();
+
+    if (!alert) {
+      throw new NotFoundError('Alert');
+    }
+
+    return alert;
+  }
+
+  static async deleteAlert(userId: string, alertId: string) {
+    const alert = await Alert.findOneAndDelete({ _id: alertId, userId });
+    
+    if (!alert) {
+      throw new NotFoundError('Alert');
+    }
+    
+    return alert;
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\alerts\alerts.test.ts =====
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import mongoose from 'mongoose';
+import request from 'supertest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { app } from '../../server';
+import { User } from '../../models/User.model';
+import { Alert } from '../../models/Alert.model';
+import { generateAccessToken } from '../../utils/jwt';
+
+vi.mock('bullmq', () => ({ Queue: vi.fn(), Worker: vi.fn() }));
+vi.mock('ioredis', () => ({ default: vi.fn() }));
+vi.mock('typesense', () => ({ default: { Client: vi.fn() }, Client: vi.fn() }));
+
+describe('Alerts API Tests', () => {
+  let mongoServer: MongoMemoryServer;
+  let token: string;
+  let userId: mongoose.Types.ObjectId;
+
+  beforeAll(async () => {
+    mongoServer = await MongoMemoryServer.create();
+    const uri = mongoServer.getUri();
+    if (mongoose.connection.readyState !== 0) await mongoose.disconnect();
+    await mongoose.connect(uri);
+  });
+
+  afterAll(async () => {
+    await mongoose.disconnect();
+    await mongoServer.stop();
+  });
+
+  beforeEach(async () => {
+    await User.deleteMany({});
+    await Alert.deleteMany({});
+
+    const user = await User.create({
+      name: 'Test User',
+      email: 'test@example.com',
+      role: 'user',
+    });
+    userId = user._id as mongoose.Types.ObjectId;
+    token = generateAccessToken({ userId: userId.toString(), email: user.email, role: user.role });
+  });
+
+  describe('POST /api/v1/alerts', () => {
+    it('should create an alert', async () => {
+      const res = await request(app)
+        .post('/api/v1/alerts')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          company: 'Google',
+          department: 'engineering',
+          location: 'remote',
+          jobCategory: 'internship',
+          channels: ['email', 'telegram'],
+        });
+      
+      expect(res.status).toBe(201);
+      expect(res.body.success).toBe(true);
+      expect(res.body.alert.company).toBe('Google');
+      expect(res.body.alert.channels).toContain('email');
+    });
+
+    it('should fail validation without channels', async () => {
+      const res = await request(app)
+        .post('/api/v1/alerts')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          company: 'Google',
+        });
+      
+      expect(res.status).toBe(422); // Zod validation
+    });
+  });
+
+  describe('GET /api/v1/alerts', () => {
+    it('should fetch user alerts', async () => {
+      await Alert.create({
+        userId,
+        company: 'Google',
+        channels: ['email'],
+      });
+
+      const res = await request(app)
+        .get('/api/v1/alerts')
+        .set('Authorization', `Bearer ${token}`);
+      
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.alerts.length).toBe(1);
+    });
+  });
+
+  describe('PUT /api/v1/alerts/:id', () => {
+    it('should update an alert', async () => {
+      const alert = await Alert.create({
+        userId,
+        company: 'Google',
+        channels: ['email'],
+      });
+
+      const res = await request(app)
+        .put(`/api/v1/alerts/${alert._id}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          channels: ['telegram'],
+        });
+      
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.alert.channels).toContain('telegram');
+      expect(res.body.alert.channels).not.toContain('email');
+    });
+
+    it('should return 404 for non-existent alert', async () => {
+      const randomId = new mongoose.Types.ObjectId();
+      const res = await request(app)
+        .put(`/api/v1/alerts/${randomId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ channels: ['email'] });
+      
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe('DELETE /api/v1/alerts/:id', () => {
+    it('should delete an alert', async () => {
+      const alert = await Alert.create({
+        userId,
+        company: 'Google',
+        channels: ['email'],
+      });
+
+      const res = await request(app)
+        .delete(`/api/v1/alerts/${alert._id}`)
+        .set('Authorization', `Bearer ${token}`);
+      
+      expect(res.status).toBe(200);
+      expect(res.body.message).toBe('Alert deleted successfully');
+
+      const count = await Alert.countDocuments();
+      expect(count).toBe(0);
+    });
+  });
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\audit\audit.service.ts =====
+import { Types } from 'mongoose';
+
+import { AuditLog } from '@/models/AuditLog.model';
+import { logger } from '@/utils/logger';
+
+export interface LogAuditParams {
+  userId?: string | Types.ObjectId;
+  email?: string;
+  action: 'Register' | 'Login' | 'Logout' | 'Refresh Token' | 'Google Login' | 'Profile Update';
+  ipAddress?: string;
+  userAgent?: string;
+  details?: Record<string, unknown>;
+}
+
+export class AuditService {
+  /**
+   * Logs an authentication or profile action to the database asynchronously.
+   * Safe method: will not throw errors to prevent blocking primary request flows.
+   */
+  public static async log(params: LogAuditParams): Promise<void> {
+    try {
+      await AuditLog.create({
+        userId: params.userId ? new Types.ObjectId(params.userId) : undefined,
+        email: params.email,
+        action: params.action,
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+        details: params.details,
+        timestamp: new Date(),
+      });
+      logger.debug(
+        `[Audit] Action logged: ${params.action} for ${params.email || params.userId || 'unknown'}`
+      );
+    } catch (error: any) {
+      logger.error(`[Audit] Failed to log action: ${params.action}. Error:`, error.message);
+    }
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\auth\auth.controller.ts =====
+import { Request, Response } from 'express';
+
+import { UnauthorizedError } from '@/middleware/errorHandler';
+import { User } from '@/models/User.model';
+import { AuditService } from '@/modules/audit/audit.service';
+import {
+  REFRESH_TOKEN_COOKIE_NAME,
+  clearRefreshTokenCookie,
+  setRefreshTokenCookie,
+} from '@/utils/cookies';
+import { verifyRefreshToken } from '@/utils/jwt';
+import { sendCreated, sendSuccess } from '@/utils/response';
+import { asyncHandler } from '@/utils/asyncHandler';
+
+import { AuthService } from './auth.service';
+
+export class AuthController {
+  /**
+   * POST /api/auth/register
+   */
+  public static register = asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const { name, email, password } = req.body;
+    const user = await AuthService.register(name, email, password);
+
+    // Fire-and-forget audit log — must not block the response
+    AuditService.log({
+      userId: user.id,
+      email: user.email,
+      action: 'Register',
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent'),
+      details: { provider: 'local' },
+    }).catch(() => {});
+
+    sendCreated(res, user, 'User registered successfully');
+  });
+
+  /**
+   * POST /api/auth/login
+   */
+  public static login = asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const { email, password } = req.body;
+    const { user, accessToken, refreshToken } = await AuthService.login(email, password);
+
+    if (refreshToken) {
+      setRefreshTokenCookie(res, refreshToken);
+    }
+
+    AuditService.log({
+      userId: user.id,
+      email: user.email,
+      action: 'Login',
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent'),
+    }).catch(() => {});
+
+    sendSuccess(res, { user, accessToken }, 'Logged in successfully');
+  });
+
+  /**
+   * POST /api/auth/google
+   */
+  public static googleLogin = asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const { credential } = req.body;
+    const { user, accessToken, refreshToken } = await AuthService.googleLogin(credential);
+
+    if (refreshToken) {
+      setRefreshTokenCookie(res, refreshToken);
+    }
+
+    AuditService.log({
+      userId: user.id,
+      email: user.email,
+      action: 'Google Login',
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent'),
+    }).catch(() => {});
+
+    sendSuccess(res, { user, accessToken }, 'Logged in via Google successfully');
+  });
+
+  /**
+   * POST /api/auth/refresh
+   */
+  public static refresh = asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    // Refresh token is expected in HTTP-only cookie
+    const token = req.cookies[REFRESH_TOKEN_COOKIE_NAME];
+
+    if (!token) {
+      throw new UnauthorizedError('Refresh token is missing');
+    }
+
+    let payload;
+    try {
+      payload = verifyRefreshToken(token);
+    } catch (err) {
+      throw new UnauthorizedError('Invalid or expired refresh token');
+    }
+
+    const { accessToken } = await AuthService.refresh(payload.userId);
+
+    AuditService.log({
+      userId: payload.userId,
+      action: 'Refresh Token',
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent'),
+    }).catch(() => {});
+
+    sendSuccess(res, { accessToken }, 'Access token refreshed successfully');
+  });
+
+  /**
+   * POST /api/auth/logout
+   */
+  public static logout = asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const token = req.cookies[REFRESH_TOKEN_COOKIE_NAME];
+    let userId: string | undefined;
+
+    if (token) {
+      try {
+        const payload = verifyRefreshToken(token);
+        userId = payload.userId;
+      } catch {
+        // Ignore token parsing errors during logout
+      }
+    }
+
+    clearRefreshTokenCookie(res);
+
+    if (userId) {
+      AuditService.log({
+        userId,
+        action: 'Logout',
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      }).catch(() => {});
+    }
+
+    sendSuccess(res, null, 'Logged out successfully');
+  });
+
+  /**
+   * GET /api/auth/me
+   */
+  public static me = asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    if (!req.user) {
+      throw new UnauthorizedError('Authentication required');
+    }
+
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      throw new UnauthorizedError('User not found');
+    }
+
+    sendSuccess(res, AuthService.mapUserToResponse(user), 'Current user retrieved successfully');
+  });
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\auth\auth.routes.ts =====
+import { Router } from 'express';
+
+import { authenticate } from '@/middleware/auth.middleware';
+import { authRateLimiter } from '@/middleware/rateLimiter';
+import { validate } from '@/middleware/validate.middleware';
+import { googleAuthSchema, loginSchema, registerSchema } from '@/validators/auth.validator';
+
+import { AuthController } from './auth.controller';
+
+const router = Router();
+
+// Apply auth rate limiter to sensitive authentication routes
+router.post('/register', authRateLimiter, validate(registerSchema), AuthController.register);
+router.post('/login', authRateLimiter, validate(loginSchema), AuthController.login);
+router.post('/google', authRateLimiter, validate(googleAuthSchema), AuthController.googleLogin);
+router.post('/refresh', AuthController.refresh);
+router.post('/logout', AuthController.logout);
+
+// Protected routes
+router.get('/me', authenticate, AuthController.me);
+
+export const authRouter = router;
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\auth\auth.service.ts =====
+import { OAuth2Client } from 'google-auth-library';
+
+import { env } from '@/config/env';
+import { ConflictError, UnauthorizedError, ValidationError } from '@/middleware/errorHandler';
+import { User } from '@/models/User.model';
+import { IUserDocument } from '@/types/user.types';
+import { generateAccessToken, generateRefreshToken } from '@/utils/jwt';
+import { comparePassword, hashPassword } from '@/utils/password';
+
+import { AuthResponse, UserResponse } from './auth.types';
+
+export class AuthService {
+  private static googleClient = new OAuth2Client(env.GOOGLE_CLIENT_ID);
+
+  /**
+   * Helper to verify a Google OAuth ID token.
+   * Exposed as a static method to facilitate easy stubbing/mocking in tests.
+   */
+  public static async verifyGoogleToken(token: string) {
+    try {
+      const ticket = await this.googleClient.verifyIdToken({
+        idToken: token,
+        audience: env.GOOGLE_CLIENT_ID,
+      });
+      return ticket.getPayload();
+    } catch (error) {
+      throw new ValidationError('Invalid Google token');
+    }
+  }
+
+  /**
+   * Registers a new user.
+   */
+  public static async register(
+    name: string,
+    email: string,
+    password: string
+  ): Promise<UserResponse> {
+    const existingUser = await User.findOne({ email }).lean();
+    if (existingUser) {
+      throw new ConflictError('User already exists');
+    }
+
+    const hashedPassword = await hashPassword(password);
+
+    const user = new User({
+      name,
+      email,
+      passwordHash: hashedPassword,
+      provider: 'local',
+      role: 'user',
+      isActive: true,
+    });
+
+    await user.save();
+
+    return this.mapUserToResponse(user);
+  }
+
+  /**
+   * Performs standard local email/password login.
+   */
+  public static async login(email: string, password: string): Promise<AuthResponse> {
+    // Explicitly select passwordHash since it has select: false in schema
+    const user = await User.findOne({ email }).select('+passwordHash');
+    if (!user || user.isDeleted || !user.isActive) {
+      throw new UnauthorizedError('Invalid credentials');
+    }
+
+    if (user.provider !== 'local') {
+      throw new UnauthorizedError(`Please log in using your registered provider: ${user.provider}`);
+    }
+
+    const isMatch = await comparePassword(password, user.passwordHash || '');
+    if (!isMatch) {
+      throw new UnauthorizedError('Invalid credentials');
+    }
+
+    // Update last login
+    user.lastLoginAt = new Date();
+    await user.save();
+
+    const userResp = this.mapUserToResponse(user);
+    const accessToken = generateAccessToken({
+      userId: userResp.id,
+      email: userResp.email,
+      role: userResp.role,
+    });
+    const refreshToken = generateRefreshToken({
+      userId: userResp.id,
+    });
+
+    return {
+      user: userResp,
+      accessToken,
+      refreshToken,
+    };
+  }
+
+  /**
+   * Performs Google OAuth verification and user lookup/creation.
+   */
+  public static async googleLogin(credential: string): Promise<AuthResponse> {
+    const payload = await this.verifyGoogleToken(credential);
+    if (!payload || !payload.email) {
+      throw new UnauthorizedError('Invalid Google credential payload');
+    }
+
+    const email = payload.email.toLowerCase();
+    let user = await User.findOne({ email });
+
+    if (user) {
+      if (user.isDeleted) {
+        throw new UnauthorizedError('User account is deleted');
+      }
+      if (!user.isActive) {
+        throw new UnauthorizedError('User account is inactive');
+      }
+
+      // SECURITY: Prevent account takeover — do NOT silently switch a local
+      // account to Google. The user must log in via their original provider.
+      if (user.provider !== 'google') {
+        throw new ConflictError(
+          'An account with this email already exists. Please log in with your email and password.'
+        );
+      }
+
+      user.lastLoginAt = new Date();
+      await user.save();
+    } else {
+      // Create new user via Google
+      user = new User({
+        name: payload.name || payload.email.split('@')[0],
+        email,
+        provider: 'google',
+        profileImage: payload.picture,
+        role: 'user',
+        isActive: true,
+      });
+      await user.save();
+    }
+
+    const userResp = this.mapUserToResponse(user);
+    const accessToken = generateAccessToken({
+      userId: userResp.id,
+      email: userResp.email,
+      role: userResp.role,
+    });
+    const refreshToken = generateRefreshToken({
+      userId: userResp.id,
+    });
+
+    return {
+      user: userResp,
+      accessToken,
+      refreshToken,
+    };
+  }
+
+  /**
+   * Refreshes JWT tokens.
+   */
+  public static async refresh(userId: string): Promise<{ accessToken: string }> {
+    const user = await User.findById(userId).lean();
+    if (!user || user.isDeleted || !user.isActive) {
+      throw new UnauthorizedError('User not found or account is inactive');
+    }
+
+    const accessToken = generateAccessToken({
+      userId: user._id.toString(),
+      email: user.email,
+      role: user.role,
+    });
+
+    return { accessToken };
+  }
+
+  /**
+   * Formats database user documents into user responses.
+   */
+  public static mapUserToResponse(
+    user: Pick<IUserDocument, '_id' | 'name' | 'email' | 'role' | 'profileImage' | 'telegramChatId' | 'discordWebhookUrl'>
+  ): UserResponse {
+    return {
+      id: user._id.toString(),
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      profileImage: user.profileImage,
+      telegramChatId: user.telegramChatId,
+      discordWebhookUrl: user.discordWebhookUrl,
+    };
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\auth\auth.test.ts =====
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import mongoose from 'mongoose';
+import request from 'supertest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { authorizeAdmin } from '../../middleware/admin.middleware';
+import { authenticate } from '../../middleware/auth.middleware';
+import { ValidationError } from '../../middleware/errorHandler';
+import { AuditLog } from '../../models/AuditLog.model';
+import { User } from '../../models/User.model';
+// Import the app and dependencies
+import { app } from '../../server';
+import { generateAccessToken, generateRefreshToken } from '../../utils/jwt';
+import { hashPassword } from '../../utils/password';
+
+import { AuthService } from './auth.service';
+
+// ────────────────────────────────────────────────
+// Mocks for External Infrastructure
+// ────────────────────────────────────────────────
+
+vi.mock('bullmq', () => {
+  return {
+    Queue: vi.fn().mockImplementation(() => {
+      return {
+        add: vi.fn(),
+        close: vi.fn().mockResolvedValue(undefined),
+      };
+    }),
+    Worker: vi.fn().mockImplementation(() => {
+      return {
+        on: vi.fn(),
+        close: vi.fn().mockResolvedValue(undefined),
+      };
+    }),
+  };
+});
+
+vi.mock('ioredis', () => {
+  return {
+    default: vi.fn().mockImplementation(() => {
+      return {
+        on: vi.fn(),
+        connect: vi.fn().mockResolvedValue(undefined),
+        quit: vi.fn().mockResolvedValue(undefined),
+        disconnect: vi.fn().mockResolvedValue(undefined),
+      };
+    }),
+  };
+});
+
+vi.mock('typesense', () => {
+  const Client = function (this: any) {
+    this.collections = vi.fn().mockReturnValue({
+      retrieve: vi.fn().mockResolvedValue({}),
+      create: vi.fn().mockResolvedValue({}),
+    });
+  };
+  return {
+    default: { Client },
+    Client,
+  };
+});
+
+// Spy on Google OAuth token verification
+const googleTokenSpy = vi
+  .spyOn(AuthService, 'verifyGoogleToken')
+  .mockImplementation(async (token) => {
+    if (token === 'valid_google_token') {
+      return {
+        email: 'googleuser@example.com',
+        name: 'Google User',
+        picture: 'http://example.com/pic.jpg',
+        email_verified: true,
+      } as any;
+    }
+    throw new ValidationError('Invalid Google token');
+  });
+
+describe('Phase 3 - Authentication & Authorization Integration Tests', () => {
+  let mongoServer: MongoMemoryServer;
+
+  beforeAll(async () => {
+    // Spin up in-memory MongoDB
+    mongoServer = await MongoMemoryServer.create();
+    const uri = mongoServer.getUri();
+
+    // Disconnect mongoose if already connected, then connect to memory server
+    if (mongoose.connection.readyState !== 0) {
+      await mongoose.disconnect();
+    }
+    await mongoose.connect(uri);
+  });
+
+  afterAll(async () => {
+    await mongoose.disconnect();
+    await mongoServer.stop();
+  });
+
+  beforeEach(async () => {
+    // Clear database state between tests
+    const collections = mongoose.connection.collections;
+    for (const key in collections) {
+      await collections[key].deleteMany({});
+    }
+    vi.clearAllMocks();
+  });
+
+  // ────────────────────────────────────────────────
+  // User Registration Tests
+  // ────────────────────────────────────────────────
+  describe('POST /api/v1/auth/register', () => {
+    const registerUrl = '/api/v1/auth/register';
+
+    it('should successfully register a new user with valid inputs', async () => {
+      const res = await request(app).post(registerUrl).send({
+        name: 'John Doe',
+        email: 'john@example.com',
+        password: 'Password123!',
+      });
+
+      expect(res.status).toBe(201);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.name).toBe('John Doe');
+      expect(res.body.data.email).toBe('john@example.com');
+      expect(res.body.data.role).toBe('user');
+      expect(res.body.data.passwordHash).toBeUndefined();
+
+      // Check DB entry
+      const user = await User.findOne({ email: 'john@example.com' });
+      expect(user).toBeTruthy();
+      expect(user?.name).toBe('John Doe');
+
+      // Verify Audit log
+      const audit = await AuditLog.findOne({ action: 'Register', email: 'john@example.com' });
+      expect(audit).toBeTruthy();
+    });
+
+    it('should fail registration if email is duplicate', async () => {
+      // Pre-create user
+      await User.create({
+        name: 'Existing',
+        email: 'john@example.com',
+        passwordHash: 'dummy_hash',
+      });
+
+      const res = await request(app).post(registerUrl).send({
+        name: 'John Doe',
+        email: 'john@example.com',
+        password: 'Password123!',
+      });
+
+      expect(res.status).toBe(409);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toContain('already exists');
+    });
+
+    it('should fail if inputs fail Zod validations', async () => {
+      // Weak password, short name
+      const res = await request(app).post(registerUrl).send({
+        name: 'J',
+        email: 'not-an-email',
+        password: 'weak',
+      });
+
+      expect(res.status).toBe(422);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toBeDefined();
+    });
+  });
+
+  // ────────────────────────────────────────────────
+  // User Login Tests
+  // ────────────────────────────────────────────────
+  describe('POST /api/v1/auth/login', () => {
+    const loginUrl = '/api/v1/auth/login';
+
+    beforeEach(async () => {
+      // Create a user for login tests
+      const passwordHash = await hashPassword('Password123!');
+      await User.create({
+        name: 'Login User',
+        email: 'login@example.com',
+        passwordHash,
+        provider: 'local',
+        role: 'user',
+        isActive: true,
+      });
+    });
+
+    it('should successfully log in and return access token in body and refresh token in cookie', async () => {
+      const res = await request(app).post(loginUrl).send({
+        email: 'login@example.com',
+        password: 'Password123!',
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.accessToken).toBeDefined();
+      expect(res.body.data.user.email).toBe('login@example.com');
+
+      // Cookie checks
+      const cookies = (res.headers['set-cookie'] as unknown as string[]) || [];
+      expect(cookies.some((c: string) => c.startsWith('refreshToken='))).toBe(true);
+      expect(cookies.some((c: string) => c.includes('HttpOnly'))).toBe(true);
+      expect(cookies.some((c: string) => c.includes('SameSite=Strict'))).toBe(true);
+
+      // Verify Audit log
+      const audit = await AuditLog.findOne({ action: 'Login', email: 'login@example.com' });
+      expect(audit).toBeTruthy();
+    });
+
+    it('should fail login on incorrect password', async () => {
+      const res = await request(app).post(loginUrl).send({
+        email: 'login@example.com',
+        password: 'WrongPassword!',
+      });
+
+      expect(res.status).toBe(401);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toContain('Invalid credentials');
+    });
+
+    it('should fail login if provider is Google but local authentication is used', async () => {
+      await User.create({
+        name: 'Google User',
+        email: 'google_only@example.com',
+        provider: 'google',
+        role: 'user',
+        isActive: true,
+      });
+
+      const res = await request(app).post(loginUrl).send({
+        email: 'google_only@example.com',
+        password: 'Password123!',
+      });
+
+      expect(res.status).toBe(401);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toContain('registered provider: google');
+    });
+  });
+
+  // ────────────────────────────────────────────────
+  // Google OAuth Login Tests
+  // ────────────────────────────────────────────────
+  describe('POST /api/v1/auth/google', () => {
+    const googleUrl = '/api/v1/auth/google';
+
+    it('should create a new user and log in if user does not exist', async () => {
+      const res = await request(app).post(googleUrl).send({ credential: 'valid_google_token' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.user.email).toBe('googleuser@example.com');
+      expect(res.body.data.user.name).toBe('Google User');
+      expect(res.body.data.accessToken).toBeDefined();
+
+      const user = await User.findOne({ email: 'googleuser@example.com' });
+      expect(user).toBeTruthy();
+      expect(user?.provider).toBe('google');
+
+      const audit = await AuditLog.findOne({
+        action: 'Google Login',
+        email: 'googleuser@example.com',
+      });
+      expect(audit).toBeTruthy();
+    });
+
+    it('should reject google login if a local account with the same email already exists (prevent account takeover)', async () => {
+      // Pre-create local user
+      await User.create({
+        name: 'Local John',
+        email: 'googleuser@example.com',
+        passwordHash: 'dummy_hash',
+        provider: 'local',
+      });
+
+      const res = await request(app).post(googleUrl).send({ credential: 'valid_google_token' });
+
+      // Should reject with 409 Conflict — not silently overwrite
+      expect(res.status).toBe(409);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toContain('already exists');
+
+      // Verify the provider was NOT changed
+      const user = await User.findOne({ email: 'googleuser@example.com' });
+      expect(user?.provider).toBe('local'); // Must remain local
+    });
+
+    it('should fail google login on invalid google token', async () => {
+      const res = await request(app).post(googleUrl).send({ credential: 'invalid_google_token' });
+
+      expect(res.status).toBe(422);
+      expect(res.body.success).toBe(false);
+    });
+  });
+
+  // ────────────────────────────────────────────────
+  // Token Refresh Tests
+  // ────────────────────────────────────────────────
+  describe('POST /api/v1/auth/refresh', () => {
+    const refreshUrl = '/api/v1/auth/refresh';
+
+    it('should issue a new access token when a valid refresh token cookie is present', async () => {
+      const user = await User.create({
+        name: 'Refresh John',
+        email: 'refresh@example.com',
+        role: 'user',
+      });
+
+      const refreshToken = generateRefreshToken({ userId: user._id.toString() });
+
+      const res = await request(app)
+        .post(refreshUrl)
+        .set('Cookie', [`refreshToken=${refreshToken}`])
+        .send();
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.accessToken).toBeDefined();
+
+      // Check Audit Log
+      const audit = await AuditLog.findOne({ action: 'Refresh Token', userId: user._id });
+      expect(audit).toBeTruthy();
+    });
+
+    it('should fail to refresh if refresh token is missing', async () => {
+      const res = await request(app).post(refreshUrl).send();
+
+      expect(res.status).toBe(401);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toContain('Refresh token is missing');
+    });
+
+    it('should fail if refresh token is invalid', async () => {
+      const res = await request(app)
+        .post(refreshUrl)
+        .set('Cookie', ['refreshToken=invalid_token'])
+        .send();
+
+      expect(res.status).toBe(401);
+      expect(res.body.success).toBe(false);
+    });
+  });
+
+  // ────────────────────────────────────────────────
+  // Logout Tests
+  // ────────────────────────────────────────────────
+  describe('POST /api/v1/auth/logout', () => {
+    const logoutUrl = '/api/v1/auth/logout';
+
+    it('should clear the cookie on logout', async () => {
+      const user = await User.create({
+        name: 'Logout John',
+        email: 'logout@example.com',
+      });
+      const refreshToken = generateRefreshToken({ userId: user._id.toString() });
+
+      const res = await request(app)
+        .post(logoutUrl)
+        .set('Cookie', [`refreshToken=${refreshToken}`])
+        .send();
+
+      expect(res.status).toBe(200);
+
+      const cookies = (res.headers['set-cookie'] as unknown as string[]) || [];
+      // Max age should be clear (expires in the past)
+      expect(
+        cookies.some(
+          (c: string) =>
+            c.includes('Max-Age=0') || c.includes('expires=') || c.startsWith('refreshToken=;')
+        )
+      ).toBe(true);
+
+      // Verify Audit log
+      const audit = await AuditLog.findOne({ action: 'Logout', userId: user._id });
+      expect(audit).toBeTruthy();
+    });
+  });
+
+  // ────────────────────────────────────────────────
+  // Protected Routes Verification Tests
+  // ────────────────────────────────────────────────
+  describe('GET /api/v1/auth/me', () => {
+    const meUrl = '/api/v1/auth/me';
+
+    it('should retrieve user details if authorized with a valid access token', async () => {
+      const user = await User.create({
+        name: 'Authorized John',
+        email: 'auth_john@example.com',
+        role: 'user',
+      });
+
+      const accessToken = generateAccessToken({
+        userId: user._id.toString(),
+        email: user.email,
+        role: user.role,
+      });
+
+      const res = await request(app).get(meUrl).set('Authorization', `Bearer ${accessToken}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.email).toBe('auth_john@example.com');
+      expect(res.body.data.name).toBe('Authorized John');
+    });
+
+    it('should reject route access if token is missing or malformed', async () => {
+      const resMissing = await request(app).get(meUrl);
+      expect(resMissing.status).toBe(401);
+
+      const resMalformed = await request(app)
+        .get(meUrl)
+        .set('Authorization', 'Bearer invalid_access_token');
+      expect(resMalformed.status).toBe(401);
+    });
+  });
+
+  // ────────────────────────────────────────────────
+  // Admin Authorization Tests
+  // ────────────────────────────────────────────────
+  describe('Admin Middleware Route Protection', () => {
+    it('should allow access to admin-only endpoints for users with admin role', async () => {
+      const adminUser = await User.create({
+        name: 'Admin Boss',
+        email: 'admin@example.com',
+        role: 'admin',
+      });
+
+      const token = generateAccessToken({
+        userId: adminUser._id.toString(),
+        email: adminUser.email,
+        role: adminUser.role,
+      });
+
+      const res = await request(app)
+        .get('/api/v1/test-admin-only')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.message).toBe('Welcome Admin!');
+    });
+
+    it('should reject access to admin-only endpoints for non-admin users', async () => {
+      const regularUser = await User.create({
+        name: 'Regular Joe',
+        email: 'regular@example.com',
+        role: 'user',
+      });
+
+      const token = generateAccessToken({
+        userId: regularUser._id.toString(),
+        email: regularUser.email,
+        role: regularUser.role,
+      });
+
+      const res = await request(app)
+        .get('/api/v1/test-admin-only')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(403);
+      expect(res.body.success).toBe(false);
+    });
+  });
+
+  // ────────────────────────────────────────────────
+  // User Profile Route Tests
+  // ────────────────────────────────────────────────
+  describe('User Profile API - GET and PUT /api/v1/users/profile', () => {
+    let regularUser: any;
+    let token: string;
+
+    beforeEach(async () => {
+      regularUser = await User.create({
+        name: 'Profile Owner',
+        email: 'profile_owner@example.com',
+        role: 'user',
+        telegramChatId: '@old_telegram',
+      });
+
+      token = generateAccessToken({
+        userId: regularUser._id.toString(),
+        email: regularUser.email,
+        role: regularUser.role,
+      });
+    });
+
+    it('should retrieve current user profile details via GET', async () => {
+      const res = await request(app)
+        .get('/api/v1/users/profile')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.email).toBe('profile_owner@example.com');
+      expect(res.body.data.telegramChatId).toBe('@old_telegram');
+    });
+
+    it('should successfully update editable profile fields via PUT', async () => {
+      const res = await request(app)
+        .put('/api/v1/users/profile')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          name: 'Updated Name',
+          profileImage: 'http://example.com/new_pic.jpg',
+          telegramChatId: '@new_telegram',
+          discordWebhookUrl: 'https://discord.com/api/webhooks/valid_webhook',
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.name).toBe('Updated Name');
+      expect(res.body.data.telegramChatId).toBe('@new_telegram');
+      expect(res.body.data.discordWebhookUrl).toBe(
+        'https://discord.com/api/webhooks/valid_webhook'
+      );
+
+      // Verify db changes
+      const user = await User.findById(regularUser._id);
+      expect(user?.name).toBe('Updated Name');
+      expect(user?.telegramChatId).toBe('@new_telegram');
+
+      // Verify audit trail
+      const audit = await AuditLog.findOne({ action: 'Profile Update', userId: regularUser._id });
+      expect(audit).toBeTruthy();
+    });
+
+    it('should ignore/block attempts to edit non-editable fields (email, role, provider)', async () => {
+      // Sending email/role changes in PUT request body
+      const res = await request(app)
+        .put('/api/v1/users/profile')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          email: 'malicious@example.com',
+          role: 'admin',
+          provider: 'google',
+        });
+
+      // The validation doesn't let these through or they are ignored by the controller since they are not editable
+      expect(res.status).toBe(200);
+
+      const user = await User.findById(regularUser._id);
+      expect(user?.email).toBe('profile_owner@example.com'); // unchanged
+      expect(user?.role).toBe('user'); // unchanged
+      expect(user?.provider).toBe('local'); // unchanged
+    });
+  });
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\auth\auth.types.ts =====
+import { UserRole } from '@/types/user.types';
+
+export interface UserResponse {
+  id: string;
+  name: string;
+  email: string;
+  role: UserRole;
+  profileImage?: string;
+  telegramChatId?: string;
+  discordWebhookUrl?: string;
+}
+
+export interface AuthResponse {
+  user: UserResponse;
+  accessToken: string;
+  refreshToken?: string;
+}
+
+export interface RefreshTokenResponse {
+  accessToken: string;
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\companies\companies.controller.ts =====
+import { Request, Response } from 'express';
+import { CompaniesService } from './companies.service';
+import { asyncHandler } from '@/utils/asyncHandler';
+
+export const getAllCompanies = asyncHandler(async (_req: Request, res: Response) => {
+  const companies = await CompaniesService.getAllCompanies();
+  res.status(200).json(companies); // API spec requested an array return: [{ name: '...', ... }]
+});
+
+export const getJobsByCompany = asyncHandler(async (req: Request, res: Response) => {
+  const jobs = await CompaniesService.getJobsByCompany(req.params.name as string);
+  
+  res.status(200).json({
+    success: true,
+    jobs,
+  });
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\companies\companies.routes.ts =====
+import { Router } from 'express';
+import { getAllCompanies, getJobsByCompany } from './companies.controller';
+
+const router = Router();
+
+router.get('/', getAllCompanies);
+router.get('/:name/jobs', getJobsByCompany);
+
+export { router as companiesRouter };
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\companies\companies.service.ts =====
+import { Company } from '@/models/Company.model';
+import { Job } from '@/models/Job.model';
+import { NotFoundError } from '@/middleware/errorHandler';
+
+export class CompaniesService {
+  static async getAllCompanies() {
+    return Company.find()
+      .select('name logoUrl industry activeJobCount -_id')
+      .lean();
+  }
+
+  static async getJobsByCompany(name: string) {
+    const companyExists = await Company.exists({ name: { $regex: new RegExp(`^${name}$`, 'i') } });
+    if (!companyExists) {
+      throw new NotFoundError('Company');
+    }
+
+    return Job.find({
+      companyName: { $regex: new RegExp(`^${name}$`, 'i') },
+      isExpired: false,
+    })
+      .sort({ createdAt: -1 })
+      .select('-description -__v')
+      .lean();
+  }
+}
+
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\companies\companies.test.ts =====
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import mongoose from 'mongoose';
+import request from 'supertest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { app } from '../../server';
+import { Job } from '../../models/Job.model';
+import { Company } from '../../models/Company.model';
+
+vi.mock('bullmq', () => ({ Queue: vi.fn(), Worker: vi.fn() }));
+vi.mock('ioredis', () => ({ default: vi.fn() }));
+vi.mock('typesense', () => ({ default: { Client: vi.fn() }, Client: vi.fn() }));
+
+describe('Companies API Tests', () => {
+  let mongoServer: MongoMemoryServer;
+
+  beforeAll(async () => {
+    mongoServer = await MongoMemoryServer.create();
+    const uri = mongoServer.getUri();
+    if (mongoose.connection.readyState !== 0) await mongoose.disconnect();
+    await mongoose.connect(uri);
+  });
+
+  afterAll(async () => {
+    await mongoose.disconnect();
+    await mongoServer.stop();
+  });
+
+  beforeEach(async () => {
+    await Job.deleteMany({});
+    await Company.deleteMany({});
+
+    const company = await Company.create({
+      name: 'Google',
+      domain: 'google.com',
+      logoUrl: 'http://logo.com',
+      careerUrl: 'http://career.com',
+      earlyCareerUrl: 'http://early.com',
+      industry: 'tech',
+      atsPlatform: 'custom',
+      scrapeStrategy: 'static',
+      activeJobCount: 1,
+    });
+
+    await Job.create({
+      jobId: 'GGL-123',
+      jobTitle: 'Software Engineer Intern',
+      companyName: 'Google',
+      companyId: company._id,
+      companyLogoUrl: 'http://logo.com',
+      industry: 'tech',
+      location: 'Mountain View, CA',
+      country: 'USA',
+      workModel: 'onsite',
+      department: 'Engineering',
+      jobCategory: 'internship',
+      applyUrl: 'http://apply.com',
+      description: 'Full description',
+      descriptionSnippet: 'Snippet',
+      sourcePlatform: 'google',
+      aiClassification: 'internship',
+      aiConfidence: 0.9,
+      classificationReason: 'testing',
+      isExpired: false,
+    });
+  });
+
+  describe('GET /api/v1/companies', () => {
+    it('should fetch all companies', async () => {
+      const res = await request(app).get('/api/v1/companies');
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body)).toBe(true);
+      expect(res.body.length).toBe(1);
+      expect(res.body[0].name).toBe('Google');
+    });
+  });
+
+  describe('GET /api/v1/companies/:name/jobs', () => {
+    it('should fetch jobs for a specific company', async () => {
+      const res = await request(app).get('/api/v1/companies/google/jobs');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.jobs.length).toBe(1);
+    });
+
+    it('should return 404 if company does not exist', async () => {
+      const res = await request(app).get('/api/v1/companies/not-exists/jobs');
+      expect(res.status).toBe(404);
+    });
+  });
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\jobs\jobs.controller.ts =====
+import { Request, Response } from 'express';
+import { JobsService } from './jobs.service';
+import { asyncHandler } from '@/utils/asyncHandler';
+import { NotFoundError } from '@/middleware/errorHandler';
+
+export const getJobs = asyncHandler(async (req: Request, res: Response) => {
+  const result = await JobsService.getJobs(req.query as any);
+  res.status(200).json({
+    success: true,
+    ...result,
+  });
+});
+
+export const getJobById = asyncHandler(async (req: Request, res: Response) => {
+  const job = await JobsService.getJobById(req.params.id as string);
+  
+  if (!job) {
+    throw new NotFoundError('Job');
+  }
+
+  res.status(200).json({
+    success: true,
+    job,
+  });
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\jobs\jobs.routes.ts =====
+import { Router } from 'express';
+import { getJobs, getJobById } from './jobs.controller';
+import { validate } from '@/middleware/validate.middleware';
+import { searchJobsSchema } from '@/validators/job.validator';
+import { saveJobSchema } from '@/validators/savedJob.validator';
+import { saveJob, removeSavedJob } from '@/modules/saved-jobs/savedJobs.controller';
+import { authenticate } from '@/middleware/auth.middleware';
+
+const router = Router();
+
+router.get('/', validate(searchJobsSchema), getJobs);
+router.get('/:id', getJobById);
+
+// Saved Jobs endpoints on Jobs resource
+router.post('/:id/save', authenticate, validate(saveJobSchema), saveJob);
+router.delete('/:id/save', authenticate, validate(saveJobSchema), removeSavedJob);
+
+export { router as jobsRouter };
+
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\jobs\jobs.service.ts =====
+import { FilterQuery } from 'mongoose';
+import { Job } from '@/models/Job.model';
+import { IJobDocument } from '@/types/job.types';
+import { SearchJobsInput } from '@/validators/job.validator';
+
+export class JobsService {
+  static async getJobs(query: SearchJobsInput['query']) {
+    const {
+      keyword,
+      company,
+      location,
+      workModel,
+      jobCategory,
+      internshipSeason,
+      department,
+      industry,
+      dateRange,
+      page = 1,
+      limit = 20,
+    } = query;
+
+    const filter: FilterQuery<IJobDocument> = {
+      isExpired: false,
+    };
+
+    if (keyword) {
+      filter.$or = [
+        { jobTitle: { $regex: keyword, $options: 'i' } },
+        { descriptionSnippet: { $regex: keyword, $options: 'i' } },
+      ];
+    }
+
+    if (company) {
+      filter.companyName = { $regex: company, $options: 'i' };
+    }
+
+    if (location) {
+      filter.location = { $regex: location, $options: 'i' };
+    }
+
+    if (workModel && workModel.length > 0) {
+      filter.workModel = { $in: workModel };
+    }
+
+    if (jobCategory && jobCategory.length > 0) {
+      filter.jobCategory = { $in: jobCategory };
+    }
+
+    if (internshipSeason && internshipSeason.length > 0) {
+      filter.internshipSeason = { $in: internshipSeason };
+    }
+
+    if (department) {
+      filter.department = { $regex: department, $options: 'i' };
+    }
+
+    if (industry) {
+      filter.industry = { $regex: industry, $options: 'i' };
+    }
+
+    if (dateRange) {
+      const now = new Date();
+      let fromDate: Date;
+      if (dateRange === 'today') {
+        fromDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+      } else if (dateRange === 'week') {
+        fromDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      } else {
+        // month
+        fromDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      }
+      filter.datePosted = { $gte: fromDate };
+    }
+
+    const skip = (page - 1) * limit;
+
+    const [jobs, total] = await Promise.all([
+      Job.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .select('-description -__v') // exclude large description in list view
+        .lean(),
+      Job.countDocuments(filter),
+    ]);
+
+    return {
+      jobs,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit) || 1,
+      },
+    };
+  }
+
+  static async getJobById(id: string) {
+    return Job.findById(id).lean();
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\jobs\jobs.test.ts =====
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import mongoose from 'mongoose';
+import request from 'supertest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { app } from '../../server';
+import { Job } from '../../models/Job.model';
+import { Company } from '../../models/Company.model';
+
+// Mocks to prevent Redis/BullMQ/Typesense from trying to connect
+vi.mock('bullmq', () => ({
+  Queue: vi.fn().mockImplementation(() => ({ add: vi.fn(), close: vi.fn().mockResolvedValue(undefined) })),
+  Worker: vi.fn().mockImplementation(() => ({ on: vi.fn(), close: vi.fn().mockResolvedValue(undefined) })),
+}));
+
+vi.mock('ioredis', () => ({
+  default: vi.fn().mockImplementation(() => ({
+    on: vi.fn(), connect: vi.fn().mockResolvedValue(undefined),
+    quit: vi.fn().mockResolvedValue(undefined), disconnect: vi.fn().mockResolvedValue(undefined),
+  })),
+}));
+
+vi.mock('typesense', () => {
+  const Client = function (this: any) {
+    this.collections = vi.fn().mockReturnValue({ retrieve: vi.fn().mockResolvedValue({}), create: vi.fn().mockResolvedValue({}) });
+  };
+  return { default: { Client }, Client };
+});
+
+describe('Jobs API Tests', () => {
+  let mongoServer: MongoMemoryServer;
+  let companyId: mongoose.Types.ObjectId;
+  let jobId: string;
+
+  beforeAll(async () => {
+    mongoServer = await MongoMemoryServer.create();
+    const uri = mongoServer.getUri();
+    if (mongoose.connection.readyState !== 0) await mongoose.disconnect();
+    await mongoose.connect(uri);
+  });
+
+  afterAll(async () => {
+    await mongoose.disconnect();
+    await mongoServer.stop();
+  });
+
+  beforeEach(async () => {
+    await Job.deleteMany({});
+    await Company.deleteMany({});
+
+    const company = await Company.create({
+      name: 'Google',
+      domain: 'google.com',
+      logoUrl: 'http://logo.com',
+      careerUrl: 'http://career.com',
+      earlyCareerUrl: 'http://early.com',
+      industry: 'tech',
+      atsPlatform: 'custom',
+      scrapeStrategy: 'static',
+      activeJobCount: 1,
+    });
+    companyId = company._id as mongoose.Types.ObjectId;
+
+    const job = await Job.create({
+      jobId: 'GGL-123',
+      jobTitle: 'Software Engineer Intern',
+      companyName: 'Google',
+      companyId,
+      companyLogoUrl: 'http://logo.com',
+      industry: 'tech',
+      location: 'Mountain View, CA',
+      country: 'USA',
+      workModel: 'onsite',
+      department: 'Engineering',
+      jobCategory: 'internship',
+      applyUrl: 'http://apply.com',
+      description: 'Full description here',
+      descriptionSnippet: 'Snippet here',
+      sourcePlatform: 'google_careers',
+      aiClassification: 'internship',
+      aiConfidence: 0.95,
+      classificationReason: 'Title says intern',
+      isExpired: false,
+    });
+    jobId = job._id.toString();
+
+    // Expired job
+    await Job.create({
+      jobId: 'GGL-456',
+      jobTitle: 'Expired Job',
+      companyName: 'Google',
+      companyId,
+      companyLogoUrl: 'http://logo.com',
+      industry: 'tech',
+      location: 'Mountain View, CA',
+      country: 'USA',
+      workModel: 'onsite',
+      department: 'Engineering',
+      jobCategory: 'internship',
+      applyUrl: 'http://apply.com',
+      description: 'Expired description',
+      descriptionSnippet: 'Expired snippet',
+      sourcePlatform: 'google_careers',
+      aiClassification: 'internship',
+      aiConfidence: 0.95,
+      classificationReason: 'Title says intern',
+      isExpired: true,
+    });
+  });
+
+  describe('GET /api/v1/jobs', () => {
+    it('should fetch jobs and exclude expired ones', async () => {
+      const res = await request(app).get('/api/v1/jobs');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.jobs.length).toBe(1);
+      expect(res.body.jobs[0].jobTitle).toBe('Software Engineer Intern');
+      expect(res.body.pagination.total).toBe(1);
+    });
+
+    it('should filter jobs by keyword', async () => {
+      const res = await request(app).get('/api/v1/jobs?keyword=Software');
+      expect(res.status).toBe(200);
+      expect(res.body.jobs.length).toBe(1);
+      
+      const res2 = await request(app).get('/api/v1/jobs?keyword=NotExists');
+      expect(res2.status).toBe(200);
+      expect(res2.body.jobs.length).toBe(0);
+    });
+  });
+
+  describe('GET /api/v1/jobs/:id', () => {
+    it('should fetch a single job by id', async () => {
+      const res = await request(app).get(`/api/v1/jobs/${jobId}`);
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.job.jobTitle).toBe('Software Engineer Intern');
+    });
+
+    it('should return 400 for invalid ObjectId format', async () => {
+      const res = await request(app).get('/api/v1/jobs/invalid_id');
+      expect(res.status).toBe(400); // Handled by global cast error
+    });
+    
+    it('should return null job if not found, wait no we throw 404', async () => {
+      const randomId = new mongoose.Types.ObjectId();
+      const res = await request(app).get(`/api/v1/jobs/${randomId}`);
+      expect(res.status).toBe(404);
+    });
+  });
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\notifications\notification.controller.ts =====
+import { Request, Response } from 'express';
+
+import { getNotificationsByUserId, markNotificationAsRead } from './notification.service';
+import { logger } from '@/utils/logger';
+
+export const getNotificationsHandler = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 20;
+
+    const result = await getNotificationsByUserId(userId, page, limit);
+
+    res.status(200).json({
+      success: true,
+      data: result.data,
+      meta: {
+        total: result.total,
+        page,
+        limit,
+        pages: result.pages,
+      },
+    });
+  } catch (error: any) {
+    logger.error('Error fetching notifications:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch notifications' });
+  }
+};
+
+export const markAsReadHandler = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { id } = req.params;
+    const notification = await markNotificationAsRead(userId, id);
+
+    if (!notification) {
+      res.status(404).json({ success: false, error: 'Notification not found' });
+      return;
+    }
+
+    res.status(200).json({ success: true, data: notification });
+  } catch (error: any) {
+    logger.error('Error marking notification as read:', error);
+    res.status(500).json({ success: false, error: 'Failed to mark notification as read' });
+  }
+};
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\notifications\notification.routes.ts =====
+import { Router } from 'express';
+
+import { authenticate } from '@/middleware/auth.middleware';
+
+import { getNotificationsHandler, markAsReadHandler } from './notification.controller';
+
+const router = Router();
+
+// All notification routes require authentication
+router.use(authenticate);
+
+router.get('/', getNotificationsHandler);
+router.patch('/:id/read', markAsReadHandler);
+
+export const notificationRouter = router;
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\notifications\notification.service.ts =====
+import { Types } from 'mongoose';
+
+import { Notification } from '@/models/Notification.model';
+import { INotificationDocument } from '@/types/notification.types';
+
+export const getNotificationsByUserId = async (
+  userId: string | Types.ObjectId,
+  page = 1,
+  limit = 20
+): Promise<{ data: INotificationDocument[]; total: number; pages: number }> => {
+  const skip = (page - 1) * limit;
+
+  const [data, total] = await Promise.all([
+    Notification.find({ userId })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .populate('jobId'),
+    Notification.countDocuments({ userId }),
+  ]);
+
+  return {
+    data,
+    total,
+    pages: Math.ceil(total / limit),
+  };
+};
+
+export const markNotificationAsRead = async (
+  userId: string | Types.ObjectId,
+  notificationId: string | Types.ObjectId
+): Promise<INotificationDocument | null> => {
+  return Notification.findOneAndUpdate(
+    { _id: notificationId, userId },
+    { $set: { isRead: true } },
+    { new: true }
+  );
+};
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\notifications\notification.test.ts =====
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import mongoose from 'mongoose';
+import request from 'supertest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { app } from '../../server';
+import { User } from '../../models/User.model';
+import { Job } from '../../models/Job.model';
+import { Alert } from '../../models/Alert.model';
+import { Notification } from '../../models/Notification.model';
+import { generateAccessToken } from '../../utils/jwt';
+import { matchAlertsForJob } from '../alerts/alerts.matcher';
+
+vi.mock('bullmq', () => ({ Queue: vi.fn(), Worker: vi.fn() }));
+vi.mock('ioredis', () => {
+  class RedisMock {
+    on = vi.fn();
+    quit = vi.fn();
+    status = 'ready';
+  }
+  return { default: RedisMock, Redis: RedisMock };
+});
+vi.mock('typesense', () => ({ default: { Client: vi.fn() }, Client: vi.fn() }));
+vi.mock('@/services/channels/email.service', () => ({ emailService: { sendEmail: vi.fn() } }));
+vi.mock('@/services/channels/telegram.service', () => ({ telegramService: { sendMessage: vi.fn() } }));
+vi.mock('@/services/channels/discord.service', () => ({ discordService: { sendWebhook: vi.fn() } }));
+
+describe('Notifications API Tests', () => {
+  let mongoServer: MongoMemoryServer;
+  let token: string;
+  let userId: mongoose.Types.ObjectId;
+
+  beforeAll(async () => {
+    mongoServer = await MongoMemoryServer.create();
+    const uri = mongoServer.getUri();
+    if (mongoose.connection.readyState !== 0) await mongoose.disconnect();
+    await mongoose.connect(uri);
+  });
+
+  afterAll(async () => {
+    await mongoose.disconnect();
+    await mongoServer.stop();
+  });
+
+  beforeEach(async () => {
+    await User.deleteMany({});
+    await Job.deleteMany({});
+    await Alert.deleteMany({});
+    await Notification.deleteMany({});
+
+    const user = await User.create({
+      name: 'Test User',
+      email: 'test@example.com',
+      role: 'user',
+    });
+    userId = user._id as mongoose.Types.ObjectId;
+    token = generateAccessToken({ userId: userId.toString(), email: user.email, role: user.role });
+  });
+
+  describe('Alerts Matcher Logic', () => {
+    it('should match jobs correctly based on alert criteria', async () => {
+      await Alert.create({
+        userId,
+        company: 'Google',
+        jobCategory: 'internship',
+        channels: ['email'],
+        isActive: true,
+      });
+
+      const matchedJob = await Job.create({
+        jobId: 'match-1',
+        jobTitle: 'Software Engineer Intern',
+        companyName: 'Google',
+        companyId: new mongoose.Types.ObjectId(),
+        companyLogoUrl: 'http://example.com/logo.png',
+        industry: 'Technology',
+        location: 'Mountain View, CA',
+        country: 'US',
+        workModel: 'onsite',
+        department: 'Engineering',
+        jobCategory: 'internship',
+        applyUrl: 'http://example.com/apply',
+        description: 'Great internship.',
+        descriptionSnippet: 'Great internship.',
+        sourcePlatform: 'greenhouse',
+        aiClassification: 'internship',
+        aiConfidence: 0.9,
+        classificationReason: 'clear',
+        isExpired: false,
+        lastSeen: new Date(),
+      });
+
+      const unmatchedJob = await Job.create({
+        jobId: 'unmatch-1',
+        jobTitle: 'Software Engineer',
+        companyName: 'Facebook',
+        companyId: new mongoose.Types.ObjectId(),
+        companyLogoUrl: 'http://example.com/logo.png',
+        industry: 'Technology',
+        location: 'Menlo Park, CA',
+        country: 'US',
+        workModel: 'onsite',
+        department: 'Engineering',
+        jobCategory: 'entry_level',
+        applyUrl: 'http://example.com/apply',
+        description: 'Great job.',
+        descriptionSnippet: 'Great job.',
+        sourcePlatform: 'greenhouse',
+        aiClassification: 'entry_level',
+        aiConfidence: 0.9,
+        classificationReason: 'clear',
+        isExpired: false,
+        lastSeen: new Date(),
+      });
+
+      const matchedResults = await matchAlertsForJob(matchedJob);
+      expect(matchedResults.length).toBe(1);
+      expect(matchedResults[0].user._id.toString()).toBe(userId.toString());
+      expect(matchedResults[0].channels).toContain('email');
+
+      const unmatchedResults = await matchAlertsForJob(unmatchedJob);
+      expect(unmatchedResults.length).toBe(0);
+    });
+  });
+
+  describe('GET /api/v1/notifications', () => {
+    it('should fetch user notifications', async () => {
+      await Notification.create({
+        userId,
+        channel: 'email',
+        status: 'sent',
+      });
+
+      const res = await request(app)
+        .get('/api/v1/notifications')
+        .set('Authorization', `Bearer ${token}`);
+      
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.length).toBe(1);
+      expect(res.body.data[0].status).toBe('sent');
+    });
+  });
+
+  describe('PATCH /api/v1/notifications/:id/read', () => {
+    it('should mark a notification as read', async () => {
+      const notification = await Notification.create({
+        userId,
+        channel: 'email',
+        status: 'sent',
+      });
+
+      expect(notification.isRead).toBe(false);
+
+      const res = await request(app)
+        .patch(`/api/v1/notifications/${notification._id}/read`)
+        .set('Authorization', `Bearer ${token}`);
+      
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.isRead).toBe(true);
+    });
+  });
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\saved-jobs\savedJobs.controller.ts =====
+import { Request, Response } from 'express';
+import { SavedJobsService } from './savedJobs.service';
+import { asyncHandler } from '@/utils/asyncHandler';
+
+export const saveJob = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.userId;
+  const { id: jobId } = req.params;
+
+  await SavedJobsService.saveJob(userId, jobId as string);
+  res.status(201).json({ success: true, message: 'Job saved successfully' });
+});
+
+export const removeSavedJob = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.userId;
+  const { id: jobId } = req.params;
+
+  await SavedJobsService.removeSavedJob(userId, jobId as string);
+  res.status(200).json({ success: true, message: 'Job removed from saved list' });
+});
+
+export const getSavedJobs = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.userId;
+  
+  const savedJobs = await SavedJobsService.getSavedJobs(userId);
+  res.status(200).json({ success: true, savedJobs });
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\saved-jobs\savedJobs.routes.ts =====
+import { Router } from 'express';
+import { getSavedJobs } from './savedJobs.controller';
+import { authenticate } from '@/middleware/auth.middleware';
+
+const router = Router();
+
+router.use(authenticate);
+
+// Note: /api/users/saved-jobs is expected to map here
+router.get('/', getSavedJobs);
+
+export { router as savedJobsRouter };
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\saved-jobs\savedJobs.service.ts =====
+import { SavedJob } from '@/models/SavedJob.model';
+import { Job } from '@/models/Job.model';
+import { NotFoundError, ConflictError } from '@/middleware/errorHandler';
+
+export class SavedJobsService {
+  static async saveJob(userId: string, jobId: string) {
+    const jobExists = await Job.exists({ _id: jobId });
+    if (!jobExists) {
+      throw new NotFoundError('Job');
+    }
+
+    try {
+      const savedJob = await SavedJob.create({ userId, jobId });
+      return savedJob;
+    } catch (error: any) {
+      if (error.code === 11000) {
+        throw new ConflictError('Duplicate save');
+      }
+      throw error;
+    }
+  }
+
+  static async removeSavedJob(userId: string, jobId: string) {
+    const result = await SavedJob.findOneAndDelete({ userId, jobId });
+    if (!result) {
+      throw new NotFoundError('Saved job');
+    }
+    return result;
+  }
+
+  static async getSavedJobs(userId: string) {
+    // Populate the jobs and return
+    const savedJobs = await SavedJob.find({ userId })
+      .populate('jobId')
+      .sort({ savedAt: -1 })
+      .lean();
+    
+    return savedJobs;
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\saved-jobs\savedJobs.test.ts =====
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import mongoose from 'mongoose';
+import request from 'supertest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { app } from '../../server';
+import { Job } from '../../models/Job.model';
+import { Company } from '../../models/Company.model';
+import { User } from '../../models/User.model';
+import { SavedJob } from '../../models/SavedJob.model';
+import { generateAccessToken } from '../../utils/jwt';
+
+vi.mock('bullmq', () => ({ Queue: vi.fn(), Worker: vi.fn() }));
+vi.mock('ioredis', () => ({ default: vi.fn() }));
+vi.mock('typesense', () => ({ default: { Client: vi.fn() }, Client: vi.fn() }));
+
+describe('Saved Jobs API Tests', () => {
+  let mongoServer: MongoMemoryServer;
+  let token: string;
+  let userId: mongoose.Types.ObjectId;
+  let jobId: string;
+
+  beforeAll(async () => {
+    mongoServer = await MongoMemoryServer.create();
+    const uri = mongoServer.getUri();
+    if (mongoose.connection.readyState !== 0) await mongoose.disconnect();
+    await mongoose.connect(uri);
+  });
+
+  afterAll(async () => {
+    await mongoose.disconnect();
+    await mongoServer.stop();
+  });
+
+  beforeEach(async () => {
+    await Job.deleteMany({});
+    await Company.deleteMany({});
+    await User.deleteMany({});
+    await SavedJob.deleteMany({});
+
+    const user = await User.create({
+      name: 'Test User',
+      email: 'test@example.com',
+      role: 'user',
+    });
+    userId = user._id as mongoose.Types.ObjectId;
+    token = generateAccessToken({ userId: userId.toString(), email: user.email, role: user.role });
+
+    const company = await Company.create({
+      name: 'Google',
+      domain: 'google.com',
+      logoUrl: 'http://logo.com',
+      careerUrl: 'http://career.com',
+      earlyCareerUrl: 'http://early.com',
+      industry: 'tech',
+      atsPlatform: 'custom',
+      scrapeStrategy: 'static',
+      activeJobCount: 1,
+    });
+
+    const job = await Job.create({
+      jobId: 'GGL-123',
+      jobTitle: 'Software Engineer Intern',
+      companyName: 'Google',
+      companyId: company._id,
+      companyLogoUrl: 'http://logo.com',
+      industry: 'tech',
+      location: 'Mountain View, CA',
+      country: 'USA',
+      workModel: 'onsite',
+      department: 'Engineering',
+      jobCategory: 'internship',
+      applyUrl: 'http://apply.com',
+      description: 'Full description',
+      descriptionSnippet: 'Snippet',
+      sourcePlatform: 'google',
+      aiClassification: 'internship',
+      aiConfidence: 0.9,
+      classificationReason: 'testing',
+      isExpired: false,
+    });
+    jobId = job._id.toString();
+  });
+
+  describe('POST /api/v1/jobs/:id/save', () => {
+    it('should save a job successfully', async () => {
+      const res = await request(app)
+        .post(`/api/v1/jobs/${jobId}/save`)
+        .set('Authorization', `Bearer ${token}`);
+      
+      expect(res.status).toBe(201);
+      expect(res.body.success).toBe(true);
+      expect(res.body.message).toBe('Job saved successfully');
+    });
+
+    it('should prevent duplicate saves', async () => {
+      await SavedJob.create({ userId, jobId });
+
+      const res = await request(app)
+        .post(`/api/v1/jobs/${jobId}/save`)
+        .set('Authorization', `Bearer ${token}`);
+      
+      expect(res.status).toBe(409); // Conflict error
+    });
+
+    it('should return 404 if job does not exist', async () => {
+      const randomId = new mongoose.Types.ObjectId();
+      const res = await request(app)
+        .post(`/api/v1/jobs/${randomId}/save`)
+        .set('Authorization', `Bearer ${token}`);
+      
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe('DELETE /api/v1/jobs/:id/save', () => {
+    it('should remove a saved job', async () => {
+      await SavedJob.create({ userId, jobId });
+
+      const res = await request(app)
+        .delete(`/api/v1/jobs/${jobId}/save`)
+        .set('Authorization', `Bearer ${token}`);
+      
+      expect(res.status).toBe(200);
+      expect(res.body.message).toBe('Job removed from saved list');
+    });
+  });
+
+  describe('GET /api/v1/users/saved-jobs', () => {
+    it('should get all saved jobs populated with job details', async () => {
+      await SavedJob.create({ userId, jobId });
+
+      const res = await request(app)
+        .get(`/api/v1/users/saved-jobs`)
+        .set('Authorization', `Bearer ${token}`);
+      
+      expect(res.status).toBe(200);
+      expect(res.body.savedJobs.length).toBe(1);
+      expect(res.body.savedJobs[0].jobId.jobTitle).toBe('Software Engineer Intern');
+    });
+  });
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\scraper\scraper.controller.ts =====
+import { Request, Response } from 'express';
+import { ScraperManager } from '../../scrapers/scraper.manager';
+
+export const triggerScrape = async (_req: Request, res: Response) => {
+  try {
+    const manager = new ScraperManager();
+    // Run asynchronously to avoid blocking request, or wait for it.
+    // For this implementation, we will start it and return success immediately, 
+    // or we can await it if it's not too long. Since 20 companies could take a few mins,
+    // we should run it in the background.
+    
+    manager.run().catch(err => console.error('Background scrape failed', err));
+
+    res.status(202).json({
+      success: true,
+      message: 'Scrape run triggered successfully. It will run in the background.'
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to trigger scrape run',
+      error: error.message
+    });
+  }
+};
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\scraper\scraper.routes.ts =====
+import { Router } from 'express';
+import { triggerScrape } from './scraper.controller';
+
+const router = Router();
+
+router.post('/trigger', triggerScrape);
+
+export default router;
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\user\user.controller.ts =====
+import { Request, Response } from 'express';
+
+import { NotFoundError, UnauthorizedError } from '@/middleware/errorHandler';
+import { User } from '@/models/User.model';
+import { AuditService } from '@/modules/audit/audit.service';
+import { AuthService } from '@/modules/auth/auth.service';
+import { asyncHandler } from '@/utils/asyncHandler';
+import { sendSuccess } from '@/utils/response';
+
+export class UserController {
+  /**
+   * GET /api/users/profile
+   * Retrieves the profile of the currently logged-in user.
+   */
+  public static getProfile = asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    if (!req.user) {
+      throw new UnauthorizedError('Authentication required');
+    }
+    
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      throw new NotFoundError('User');
+    }
+    
+    sendSuccess(res, AuthService.mapUserToResponse(user), 'Profile retrieved successfully');
+  });
+
+  /**
+   * PUT /api/users/profile
+   * Updates allowed profile fields.
+   */
+  public static updateProfile = asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    if (!req.user) {
+      throw new UnauthorizedError('Authentication required');
+    }
+    
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      throw new NotFoundError('User');
+    }
+
+    const { name, profileImage, telegramChatId, discordWebhookUrl } = req.body;
+
+    if (name !== undefined) user.name = name;
+    if (profileImage !== undefined) user.profileImage = profileImage;
+    if (telegramChatId !== undefined) user.telegramChatId = telegramChatId;
+    if (discordWebhookUrl !== undefined) user.discordWebhookUrl = discordWebhookUrl;
+
+    await user.save();
+
+    // Log the audit event asynchronously
+    AuditService.log({
+      userId: user._id.toString(),
+      email: user.email,
+      action: 'Profile Update',
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent'),
+      details: {
+        updatedFields: Object.keys(req.body),
+      },
+    }).catch(() => {});
+
+    sendSuccess(res, AuthService.mapUserToResponse(user), 'Profile updated successfully');
+  });
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\modules\user\user.routes.ts =====
+import { Router } from 'express';
+
+import { authenticate } from '@/middleware/auth.middleware';
+import { validate } from '@/middleware/validate.middleware';
+import { updateProfileSchema } from '@/validators/auth.validator';
+import { getSavedJobs } from '@/modules/saved-jobs/savedJobs.controller';
+
+import { UserController } from './user.controller';
+
+const router = Router();
+
+router.get('/profile', authenticate, UserController.getProfile);
+router.put('/profile', authenticate, validate(updateProfileSchema), UserController.updateProfile);
+router.get('/saved-jobs', authenticate, getSavedJobs);
+
+export const userRouter = router;
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\queues\classification.queue.ts =====
+import { classificationQueue } from '@/config/bullmq';
+import { logger } from '@/utils/logger';
+
+export interface ClassificationJobPayload {
+  jobId: string;
+  companyName: string;
+}
+
+export async function addJobToClassificationQueue(
+  payload: ClassificationJobPayload
+) {
+  try {
+    await classificationQueue.add('classifyJob', payload, {
+      jobId: `${payload.jobId}-${payload.companyName}`,
+      removeOnComplete: true,
+      removeOnFail: false,
+    });
+    logger.info(
+      `Added job ${payload.jobId} from ${payload.companyName} to classification queue`
+    );
+  } catch (error: any) {
+    logger.error('Failed to add job to classification queue:', error.message);
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\queues\notification.queue.ts =====
+import { notificationsQueue } from '@/config/bullmq';
+import { logger } from '@/utils/logger';
+
+export interface NotificationJobPayload {
+  jobId: string;
+  companyName: string;
+}
+
+export const addJobToNotificationQueue = async (
+  payload: NotificationJobPayload
+): Promise<void> => {
+  try {
+    await notificationsQueue.add('sendNotifications', payload, {
+      jobId: `notify-${payload.companyName}-${payload.jobId}`,
+    });
+    logger.debug(`Added job ${payload.jobId} to notifications queue`);
+  } catch (error) {
+    logger.error(`Failed to add job ${payload.jobId} to notifications queue:`, error);
+  }
+};
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\scrapers\scheduler.ts =====
+import cron from 'node-cron';
+import { ScraperManager } from './scraper.manager';
+import { scraperLogger } from './utils/logger';
+
+export function initializeScheduler() {
+  // Run daily at midnight
+  cron.schedule('0 0 * * *', async () => {
+    scraperLogger.info('Starting scheduled scraper run...');
+    const manager = new ScraperManager();
+    try {
+      await manager.run();
+    } catch (error) {
+      scraperLogger.error('Scheduled scraper run failed', error);
+    }
+  });
+
+  scraperLogger.info('Scraper scheduler initialized.');
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\scrapers\scraper.manager.ts =====
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { Job } from '../models/Job.model';
+import { ScrapeLog } from '../models/ScrapeLog.model';
+import { Company } from '../models/Company.model';
+import { GreenhouseScraper } from './ats/greenhouse.scraper';
+import { LeverScraper } from './ats/lever.scraper';
+import { WorkdayScraper } from './ats/workday.scraper';
+import { IcimsScraper } from './ats/icims.scraper';
+import { SuccessFactorsScraper } from './ats/successfactors.scraper';
+import { isEarlyCareer } from './filters/relevance.filter';
+import { normalizeJob } from './utils/normalizeJob';
+import { withRetry } from './utils/retry';
+import { scraperLogger } from './utils/logger';
+import { RawJob } from './base/scraper.types';
+import { addJobToClassificationQueue } from '../queues/classification.queue';
+
+const CONCURRENCY_LIMIT = 3;
+
+function randomDelay(min: number, max: number) {
+  return new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1) + min)));
+}
+
+export class ScraperManager {
+  private scrapers: Record<string, any>;
+
+  constructor() {
+    this.scrapers = {
+      greenhouse: new GreenhouseScraper(),
+      lever: new LeverScraper(),
+      workday: new WorkdayScraper(),
+      icims: new IcimsScraper(),
+      successfactors: new SuccessFactorsScraper(),
+    };
+  }
+
+  async run() {
+    const runId = crypto.randomUUID();
+    scraperLogger.info(`Starting scrape run: ${runId}`);
+
+    const scrapeLog = await ScrapeLog.create({
+      runId,
+      startedAt: new Date(),
+      companiesAttempted: 0,
+      companiesSucceeded: 0,
+      jobsScraped: 0,
+      jobsAccepted: 0,
+      jobsRejected: 0,
+      errors: [],
+    });
+
+    const companiesPath = path.join(__dirname, '../data/companies.json');
+    const companiesData = JSON.parse(fs.readFileSync(companiesPath, 'utf8'));
+
+    const activeJobIdsThisRun: Set<string> = new Set();
+    const errors: { company: string; error: string }[] = [];
+    let jobsScraped = 0;
+    let jobsAccepted = 0;
+    let jobsRejected = 0;
+    let companiesSucceeded = 0;
+
+    // Process in chunks
+    for (let i = 0; i < companiesData.length; i += CONCURRENCY_LIMIT) {
+      const chunk = companiesData.slice(i, i + CONCURRENCY_LIMIT);
+      
+      await Promise.all(chunk.map(async (companyData: any) => {
+        try {
+          await randomDelay(2000, 5000);
+          
+          let companyDoc = await Company.findOne({ domain: companyData.domain });
+          if (!companyDoc) {
+            companyDoc = await Company.create({
+              name: companyData.name,
+              domain: companyData.domain,
+              logoUrl: companyData.logoUrl,
+              careerUrl: companyData.careerUrl,
+              earlyCareerUrl: companyData.earlyCareerUrl,
+              industry: companyData.industry,
+              atsPlatform: companyData.atsPlatform,
+              scrapeStrategy: companyData.scrapeStrategy,
+            });
+          }
+
+          const scraper = this.scrapers[companyData.atsPlatform];
+          if (!scraper) {
+            scraperLogger.warn(`No scraper found for ${companyData.atsPlatform} (Company: ${companyData.name})`);
+            return;
+          }
+
+          const rawJobs = await withRetry<RawJob[]>(() => scraper.scrape(companyData));
+          jobsScraped += rawJobs.length;
+
+          for (const rawJob of rawJobs) {
+            const normalized = normalizeJob(rawJob, companyData.name);
+            
+            if (isEarlyCareer(normalized.title)) {
+              jobsAccepted++;
+              
+              const compoundId = `${normalized.jobId}-${companyData.name}`;
+              activeJobIdsThisRun.add(compoundId);
+
+              // Update or Insert
+              await Job.findOneAndUpdate(
+                { jobId: normalized.jobId, companyName: companyData.name },
+                {
+                  $set: {
+                    jobTitle: normalized.title,
+                    companyId: companyDoc._id,
+                    companyLogoUrl: companyData.logoUrl,
+                    industry: companyData.industry,
+                    location: normalized.location,
+                    country: 'US', // default placeholder
+                    workModel: 'onsite', // default placeholder
+                    department: 'Engineering', // default placeholder
+                    jobCategory: 'entry_level', // default placeholder
+                    applyUrl: normalized.applyUrl,
+                    description: normalized.description || 'No description provided.',
+                    descriptionSnippet: normalized.description ? normalized.description.substring(0, 150) : 'No description provided.',
+                    sourcePlatform: companyData.atsPlatform,
+                    datePosted: normalized.datePosted,
+                    aiClassification: 'entry_level', // default placeholder
+                    aiConfidence: 0.5, // default placeholder
+                    classificationReason: 'Pending AI Classification', // default placeholder
+                    isExpired: false,
+                    lastSeen: new Date(),
+                  }
+                },
+                { upsert: true, new: true, runValidators: true }
+              );
+
+              // Add to AI Classification Queue
+              await addJobToClassificationQueue({
+                jobId: normalized.jobId,
+                companyName: companyData.name,
+              });
+            } else {
+              jobsRejected++;
+            }
+          }
+
+          companyDoc.activeJobCount = jobsAccepted;
+          companyDoc.lastScrapedAt = new Date();
+          await companyDoc.save();
+
+          companiesSucceeded++;
+          scraperLogger.success(`Successfully scraped ${companyData.name}`);
+        } catch (error: any) {
+          errors.push({ company: companyData.name, error: error.message || String(error) });
+          scraperLogger.error(`Failed to scrape ${companyData.name}`, error.message);
+        }
+      }));
+    }
+
+    // Mark missing jobs as expired
+    if (companiesSucceeded > 0) {
+      await Job.updateMany(
+        { 
+          companyName: { $in: companiesData.map((c: any) => c.name) },
+          lastSeen: { $lt: new Date(Date.now() - 1000 * 60 * 60 * 12) }, // Older than 12 hours
+          isExpired: false
+        },
+        { 
+          $set: { isExpired: true, expiredAt: new Date() } 
+        }
+      );
+    }
+
+    scrapeLog.finishedAt = new Date();
+    scrapeLog.companiesAttempted = companiesData.length;
+    scrapeLog.companiesSucceeded = companiesSucceeded;
+    scrapeLog.jobsScraped = jobsScraped;
+    scrapeLog.jobsAccepted = jobsAccepted;
+    scrapeLog.jobsRejected = jobsRejected;
+    scrapeLog.errors = errors as any;
+    await scrapeLog.save();
+
+    scraperLogger.info(`Finished scrape run: ${runId}`);
+    return scrapeLog;
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\scrapers\ats\greenhouse.scraper.ts =====
+import axios from 'axios';
+import { BaseScraper } from '../base/base.scraper';
+import { RawJob } from '../base/scraper.types';
+
+export class GreenhouseScraper extends BaseScraper {
+  async scrape(company: any): Promise<RawJob[]> {
+    const boardToken = company.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const url = `https://boards-api.greenhouse.io/v1/boards/${boardToken}/jobs?content=true`;
+
+    try {
+      const response = await axios.get(url);
+      const jobs = response.data.jobs || [];
+
+      return jobs.map((job: any) => ({
+        jobId: job.id.toString(),
+        title: job.title,
+        location: job.location?.name || 'Unknown',
+        description: job.content || '',
+        applyUrl: job.absolute_url,
+        updated_at: job.updated_at,
+      }));
+    } catch (error: any) {
+      // Return empty array if board not found or other errors
+      if (error.response && error.response.status === 404) {
+        return [];
+      }
+      throw error;
+    }
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\scrapers\ats\icims.scraper.ts =====
+import { chromium } from 'playwright';
+import { BaseScraper } from '../base/base.scraper';
+import { RawJob } from '../base/scraper.types';
+import { scraperLogger } from '../utils/logger';
+
+export class IcimsScraper extends BaseScraper {
+  async scrape(company: any): Promise<RawJob[]> {
+    const url = company.earlyCareerUrl || company.careerUrl;
+    if (!url) return [];
+
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    });
+    const page = await context.newPage();
+
+    const jobs: RawJob[] = [];
+
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      
+      // iCIMS often loads the job portal in an iframe with id "icims_content_iframe"
+      const iframeElement = await page.$('iframe#icims_content_iframe');
+      let frame = page.mainFrame();
+
+      if (iframeElement) {
+        frame = await iframeElement.contentFrame() || frame;
+      }
+
+      try {
+        await frame.waitForSelector('.iCIMS_JobsTable .row', { timeout: 10000 });
+      } catch (e) {
+        scraperLogger.warn(`Timeout waiting for iCIMS job results on ${company.name}`);
+        return [];
+      }
+
+      const jobRows = await frame.$$('.iCIMS_JobsTable .row');
+
+      for (const row of jobRows) {
+        const titleElement = await row.$('.title a');
+        if (!titleElement) continue;
+
+        const title = await titleElement.innerText();
+        const applyUrlPath = await titleElement.getAttribute('href');
+        const applyUrl = applyUrlPath ? new URL(applyUrlPath, url).toString() : url;
+
+        // Try to get location, usually in a span next to title or another column
+        const descElement = await row.$('.description, .additionalFields');
+        const locationText = descElement ? await descElement.innerText() : 'Unknown';
+
+        const jobId = Buffer.from(title + locationText).toString('base64');
+
+        jobs.push({
+          jobId,
+          title: title.trim(),
+          location: locationText.trim(),
+          applyUrl,
+          description: '',
+          updated_at: new Date().toISOString()
+        });
+      }
+    } catch (error) {
+      scraperLogger.error(`Error scraping iCIMS for ${company.name}`, error);
+      throw error;
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+
+    return jobs;
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\scrapers\ats\lever.scraper.ts =====
+import axios from 'axios';
+import { BaseScraper } from '../base/base.scraper';
+import { RawJob } from '../base/scraper.types';
+
+export class LeverScraper extends BaseScraper {
+  async scrape(company: any): Promise<RawJob[]> {
+    const boardToken = company.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const url = `https://api.lever.co/v0/postings/${boardToken}?mode=json`;
+
+    try {
+      const response = await axios.get(url);
+      const jobs = response.data || [];
+
+      return jobs.map((job: any) => ({
+        jobId: job.id,
+        title: job.text,
+        location: job.categories?.location || 'Unknown',
+        description: job.descriptionPlain || job.description || '',
+        applyUrl: job.applyUrl || job.hostedUrl,
+        updated_at: job.createdAt ? new Date(job.createdAt).toISOString() : new Date().toISOString(),
+      }));
+    } catch (error: any) {
+      if (error.response && error.response.status === 404) {
+        return [];
+      }
+      throw error;
+    }
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\scrapers\ats\successfactors.scraper.ts =====
+import { chromium } from 'playwright';
+import { BaseScraper } from '../base/base.scraper';
+import { RawJob } from '../base/scraper.types';
+import { scraperLogger } from '../utils/logger';
+
+export class SuccessFactorsScraper extends BaseScraper {
+  async scrape(company: any): Promise<RawJob[]> {
+    const url = company.earlyCareerUrl || company.careerUrl;
+    if (!url) return [];
+
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    });
+    const page = await context.newPage();
+
+    const jobs: RawJob[] = [];
+
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      
+      try {
+        await page.waitForSelector('.jobSearchResults tr.jobResultItem', { timeout: 10000 });
+      } catch (e) {
+        scraperLogger.warn(`Timeout waiting for SuccessFactors job results on ${company.name}`);
+        return [];
+      }
+
+      const jobRows = await page.$$('.jobSearchResults tr.jobResultItem');
+
+      for (const row of jobRows) {
+        const titleElement = await row.$('.jobTitle a');
+        if (!titleElement) continue;
+
+        const title = await titleElement.innerText();
+        const applyUrlPath = await titleElement.getAttribute('href');
+        const applyUrl = applyUrlPath ? new URL(applyUrlPath, url).toString() : url;
+
+        const locationElement = await row.$('.jobLocation');
+        const location = locationElement ? await locationElement.innerText() : 'Unknown';
+
+        const jobId = Buffer.from(title + location).toString('base64');
+
+        jobs.push({
+          jobId,
+          title: title.trim(),
+          location: location.trim(),
+          applyUrl,
+          description: '',
+          updated_at: new Date().toISOString()
+        });
+      }
+    } catch (error) {
+      scraperLogger.error(`Error scraping SuccessFactors for ${company.name}`, error);
+      throw error;
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+
+    return jobs;
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\scrapers\ats\workday.scraper.ts =====
+import { chromium } from 'playwright';
+import { BaseScraper } from '../base/base.scraper';
+import { RawJob } from '../base/scraper.types';
+import { scraperLogger } from '../utils/logger';
+
+export class WorkdayScraper extends BaseScraper {
+  async scrape(company: any): Promise<RawJob[]> {
+    const url = company.earlyCareerUrl || company.careerUrl;
+    if (!url) return [];
+
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    });
+    const page = await context.newPage();
+
+    const jobs: RawJob[] = [];
+
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      
+      // Attempt to wait for job listings. Workday usually has a <ul> with job list or similar cards.
+      // This selector is a generic fallback that often matches Workday lists.
+      try {
+        await page.waitForSelector('[data-automation-id="jobResults"] li', { timeout: 10000 });
+      } catch (e) {
+        scraperLogger.warn(`Timeout waiting for Workday job results on ${company.name}`);
+        // Return empty if we can't find jobs
+        return [];
+      }
+
+      const jobCards = await page.$$('[data-automation-id="jobResults"] li');
+
+      for (const card of jobCards) {
+        const titleElement = await card.$('h3 a');
+        if (!titleElement) continue;
+
+        const title = await titleElement.innerText();
+        const applyUrlPath = await titleElement.getAttribute('href');
+        const applyUrl = applyUrlPath ? new URL(applyUrlPath, url).toString() : url;
+
+        const locationElement = await card.$('[data-automation-id="locations"]');
+        const location = locationElement ? await locationElement.innerText() : 'Unknown';
+
+        const jobIdElement = await card.$('[data-automation-id="jobResultsJobId"]');
+        const jobId = jobIdElement ? await jobIdElement.innerText() : Buffer.from(title + location).toString('base64');
+
+        jobs.push({
+          jobId,
+          title: title.trim(),
+          location: location.trim(),
+          applyUrl,
+          description: '', // Usually not present in the list view
+          updated_at: new Date().toISOString()
+        });
+      }
+    } catch (error) {
+      scraperLogger.error(`Error scraping Workday for ${company.name}`, error);
+      throw error;
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+
+    return jobs;
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\scrapers\base\base.scraper.ts =====
+import { RawJob } from './scraper.types';
+
+export abstract class BaseScraper {
+  abstract scrape(company: any): Promise<RawJob[]>;
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\scrapers\base\scraper.types.ts =====
+export interface RawJob {
+  title: string;
+  location: string;
+  description?: string;
+  applyUrl: string;
+  updated_at?: string;
+  jobId?: string;
+}
+
+export interface NormalizedJob {
+  jobId: string;
+  title: string;
+  description: string;
+  companyName: string;
+  location: string;
+  applyUrl: string;
+  datePosted?: Date;
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\scrapers\filters\relevance.filter.ts =====
+const INCLUDE_KEYWORDS = [
+  'intern',
+  'internship',
+  'co-op',
+  'coop',
+  'apprentice',
+  'trainee',
+  'new grad',
+  'entry level',
+  'junior',
+  'associate',
+  'graduate',
+  'student'
+];
+
+const EXCLUDE_KEYWORDS = [
+  'senior',
+  'lead',
+  'manager',
+  'director',
+  'principal',
+  'vp',
+  'head'
+];
+
+export function isEarlyCareer(title: string): boolean {
+  const lowerTitle = title.toLowerCase();
+
+  // If contains exclude -> reject
+  for (const exclude of EXCLUDE_KEYWORDS) {
+    if (lowerTitle.includes(exclude)) {
+      return false;
+    }
+  }
+
+  // If contains include -> accept
+  for (const include of INCLUDE_KEYWORDS) {
+    if (lowerTitle.includes(include)) {
+      return true;
+    }
+  }
+
+  // Else reject
+  return false;
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\scrapers\utils\logger.ts =====
+export const scraperLogger = {
+  info: (msg: string, meta?: any) => {
+    console.log(`[INFO] ${msg}`, meta ? JSON.stringify(meta) : '');
+  },
+  error: (msg: string, meta?: any) => {
+    console.error(`[ERROR] ${msg}`, meta ? JSON.stringify(meta) : '');
+  },
+  success: (msg: string, meta?: any) => {
+    console.log(`[SUCCESS] ${msg}`, meta ? JSON.stringify(meta) : '');
+  },
+  warn: (msg: string, meta?: any) => {
+    console.warn(`[WARN] ${msg}`, meta ? JSON.stringify(meta) : '');
+  }
+};
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\scrapers\utils\normalizeJob.ts =====
+import { NormalizedJob, RawJob } from '../base/scraper.types';
+
+export function normalizeJob(rawJob: RawJob, companyName: string): NormalizedJob {
+  // Generate a fallback jobId if not provided
+  const generatedId = rawJob.jobId || Buffer.from(`${companyName}-${rawJob.title}-${rawJob.location}`).toString('base64');
+  
+  return {
+    jobId: generatedId,
+    title: rawJob.title,
+    description: rawJob.description || '',
+    companyName,
+    location: rawJob.location,
+    applyUrl: rawJob.applyUrl,
+    datePosted: rawJob.updated_at ? new Date(rawJob.updated_at) : new Date(),
+  };
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\scrapers\utils\retry.ts =====
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 2,
+  delayMs: number = 1000
+): Promise<T> {
+  let attempt = 0;
+  while (attempt <= maxRetries) {
+    try {
+      return await fn();
+    } catch (error) {
+      attempt++;
+      if (attempt > maxRetries) {
+        throw error;
+      }
+      await new Promise(res => setTimeout(res, delayMs));
+    }
+  }
+  throw new Error('Unreachable code in retry');
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\services\ai\ai.types.ts =====
+import { z } from 'zod';
+
+export type Classification =
+  | 'internship'
+  | 'new_grad'
+  | 'entry_level'
+  | 'co_op'
+  | 'rotational'
+  | 'experienced';
+
+export const classificationSchema = z.object({
+  classification: z.enum([
+    'internship',
+    'new_grad',
+    'entry_level',
+    'co_op',
+    'rotational',
+    'experienced',
+  ]),
+  confidence: z.number().min(0).max(1),
+  reason: z.string().min(1),
+});
+
+export type AIClassificationResult = z.infer<typeof classificationSchema>;
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\services\ai\classifier.service.ts =====
+import { GoogleGenAI } from '@google/genai';
+
+import { env } from '@/config/env';
+import { logger } from '@/utils/logger';
+import { AiCache } from '@/utils/aiCache';
+
+import {
+  AIClassificationResult,
+  classificationSchema,
+  Classification,
+} from './ai.types';
+import { buildClassificationPrompt } from './prompt.builder';
+
+export class ClassifierService {
+  private ai: GoogleGenAI;
+
+  constructor() {
+    this.ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY || '' });
+  }
+
+  /**
+   * Simple fallback matching logic if the LLM fails.
+   */
+  private fallbackClassification(title: string): Classification {
+    const t = title.toLowerCase();
+    if (t.includes('intern') || t.includes('internship')) return 'internship';
+    if (t.includes('new grad') || t.includes('university grad'))
+      return 'new_grad';
+    if (t.includes('co-op') || t.includes('coop')) return 'co_op';
+    if (t.includes('rotation')) return 'rotational';
+    if (t.includes('entry') || t.includes('junior')) return 'entry_level';
+    return 'experienced';
+  }
+
+  public async classifyJob(
+    title: string,
+    description: string
+  ): Promise<AIClassificationResult> {
+    // 1. Check Cache
+    const cached = await AiCache.getClassification(title, description);
+    if (cached) {
+      return cached;
+    }
+
+    try {
+      if (!env.GEMINI_API_KEY) {
+        throw new Error('GEMINI_API_KEY is not configured');
+      }
+
+      // 2. Build Prompt
+      const prompt = buildClassificationPrompt(title, description);
+
+      // 3. Call LLM
+      const response = await this.ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          temperature: 0.1, // Low temp for deterministic classification
+        },
+      });
+
+      const text = response.text;
+      if (!text) {
+        throw new Error('Empty response from Gemini');
+      }
+
+      // 4. Parse & Validate
+      const parsedJson = JSON.parse(text);
+      const validated = classificationSchema.parse(parsedJson);
+
+      // 5. Update Cache
+      await AiCache.setClassification(title, description, validated);
+
+      return validated;
+    } catch (error: any) {
+      logger.error('Failed to classify job with AI:', error.message);
+
+      // Fallback Strategy
+      const fallbackClass = this.fallbackClassification(title);
+      return {
+        classification: fallbackClass,
+        confidence: 0.5,
+        reason: 'Fallback keyword classification used due to AI failure.',
+      };
+    }
+  }
+}
+
+export const classifierService = new ClassifierService();
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\services\ai\prompt.builder.ts =====
+export function buildClassificationPrompt(title: string, description: string): string {
+  return `You are an expert job classifier.
+
+Classify the following job:
+
+Title:
+${title}
+
+Description:
+${description}
+
+Return JSON:
+{
+  "classification": "...",
+  "confidence": 0.0-1.0,
+  "reason": "short explanation"
+}
+
+Rules:
+- internship → student roles
+- new_grad → fresh graduates
+- entry_level → 0-1 year
+- co_op → co-op programs
+- rotational → rotation programs
+- experienced → 2+ years roles
+
+Be strict. If unsure, classify as experienced.`;
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\services\ai\__tests__\classifier.service.test.ts =====
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+import { classifierService } from '../classifier.service';
+import { AiCache } from '@/utils/aiCache';
+import { env } from '@/config/env';
+import { GoogleGenAI } from '@google/genai';
+
+vi.mock('@google/genai', () => {
+  const mockGenerateContent = vi.fn();
+  return {
+    GoogleGenAI: class {
+      models = {
+        generateContent: mockGenerateContent,
+      };
+    },
+  };
+});
+
+vi.mock('@/utils/aiCache', () => ({
+  AiCache: {
+    getClassification: vi.fn(),
+    setClassification: vi.fn(),
+  },
+}));
+
+vi.mock('@/config/env', () => ({
+  env: {
+    GEMINI_API_KEY: 'test-api-key',
+  },
+}));
+
+describe('ClassifierService', () => {
+  let mockGenAIInstance: any;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGenAIInstance = new GoogleGenAI({ apiKey: 'test' });
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('should return cached result if available', async () => {
+    const cachedResult = {
+      classification: 'internship',
+      confidence: 0.9,
+      reason: 'It is a summer internship',
+    };
+    vi.mocked(AiCache.getClassification).mockResolvedValue(cachedResult as any);
+
+    const result = await classifierService.classifyJob(
+      'Software Engineer Intern',
+      'Summer 2024 intern program.'
+    );
+
+    expect(result).toEqual(cachedResult);
+    expect(mockGenAIInstance.models.generateContent).not.toHaveBeenCalled();
+  });
+
+  it('should call Gemini API and parse correctly when not in cache', async () => {
+    vi.mocked(AiCache.getClassification).mockResolvedValue(null);
+
+    const mockResponse = {
+      text: JSON.stringify({
+        classification: 'entry_level',
+        confidence: 0.85,
+        reason: 'Mentions 0-1 years of experience',
+      }),
+    };
+
+    // Override the mock implementation for this test to return the mock response.
+    // The singleton was initialized before the mock was updated.
+    // We can directly mock the generateContent on the service's AI instance.
+    (classifierService as any).ai.models.generateContent = vi
+      .fn()
+      .mockResolvedValue(mockResponse);
+
+    const result = await classifierService.classifyJob(
+      'Junior Developer',
+      'Requires 0-1 years of experience.'
+    );
+
+    expect(result).toEqual({
+      classification: 'entry_level',
+      confidence: 0.85,
+      reason: 'Mentions 0-1 years of experience',
+    });
+
+    expect(
+      (classifierService as any).ai.models.generateContent
+    ).toHaveBeenCalled();
+    expect(AiCache.setClassification).toHaveBeenCalledWith(
+      'Junior Developer',
+      'Requires 0-1 years of experience.',
+      result
+    );
+  });
+
+  it('should fallback to keyword classification if Gemini API fails', async () => {
+    vi.mocked(AiCache.getClassification).mockResolvedValue(null);
+
+    (classifierService as any).ai.models.generateContent = vi
+      .fn()
+      .mockRejectedValue(new Error('API Error'));
+
+    const result = await classifierService.classifyJob(
+      'Software Engineer Intern',
+      'Summer 2024 intern program.'
+    );
+
+    expect(result).toEqual({
+      classification: 'internship',
+      confidence: 0.5,
+      reason: 'Fallback keyword classification used due to AI failure.',
+    });
+  });
+
+  it('should fallback if JSON is invalid', async () => {
+    vi.mocked(AiCache.getClassification).mockResolvedValue(null);
+
+    (classifierService as any).ai.models.generateContent = vi
+      .fn()
+      .mockResolvedValue({ text: 'invalid json' });
+
+    const result = await classifierService.classifyJob(
+      'New Grad SWE',
+      'Starts August 2024'
+    );
+
+    expect(result).toEqual({
+      classification: 'new_grad',
+      confidence: 0.5,
+      reason: 'Fallback keyword classification used due to AI failure.',
+    });
+  });
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\services\channels\discord.service.ts =====
+import { logger } from '@/utils/logger';
+
+export const discordService = {
+  sendWebhook: async (webhookUrl: string, content: string, embeds?: any[]): Promise<void> => {
+    if (!webhookUrl) {
+      logger.warn(`Discord webhook not sent (missing URL).`);
+      return;
+    }
+
+    try {
+      const response = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content,
+          embeds,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Discord API Error: ${response.statusText}`);
+      }
+      logger.info(`Discord webhook sent successfully`);
+    } catch (err: any) {
+      logger.error(`Failed to send Discord webhook: ${err.message}`);
+      throw err;
+    }
+  },
+};
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\services\channels\email.service.ts =====
+import { Resend } from 'resend';
+import { env } from '@/config/env';
+import { logger } from '@/utils/logger';
+
+const resend = env.RESEND_API_KEY ? new Resend(env.RESEND_API_KEY) : null;
+
+export const emailService = {
+  sendEmail: async (to: string, subject: string, html: string): Promise<void> => {
+    if (!resend || !env.RESEND_FROM_EMAIL) {
+      logger.warn(`Email not sent (missing Resend config). To: ${to}, Subject: ${subject}`);
+      return;
+    }
+
+    try {
+      const { error } = await resend.emails.send({
+        from: env.RESEND_FROM_EMAIL,
+        to,
+        subject,
+        html,
+      });
+
+      if (error) {
+        throw new Error(error.message);
+      }
+      logger.info(`Email sent successfully to ${to}`);
+    } catch (err: any) {
+      logger.error(`Failed to send email to ${to}: ${err.message}`);
+      throw err;
+    }
+  },
+};
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\services\channels\telegram.service.ts =====
+import { env } from '@/config/env';
+import { logger } from '@/utils/logger';
+
+export const telegramService = {
+  sendMessage: async (chatId: string, text: string): Promise<void> => {
+    if (!env.TELEGRAM_BOT_TOKEN) {
+      logger.warn(`Telegram message not sent (missing bot token). ChatId: ${chatId}`);
+      return;
+    }
+
+    const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+    
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text,
+          parse_mode: 'HTML',
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(`Telegram API Error: ${errorData.description || response.statusText}`);
+      }
+      logger.info(`Telegram message sent successfully to ${chatId}`);
+    } catch (err: any) {
+      logger.error(`Failed to send Telegram message to ${chatId}: ${err.message}`);
+      throw err;
+    }
+  },
+};
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\types\alert.types.ts =====
+import { Document, Types } from 'mongoose';
+
+import { JobCategory } from './job.types';
+
+export type AlertChannel = 'email' | 'telegram' | 'discord';
+
+export interface IAlert {
+  userId: Types.ObjectId;
+  company?: string;
+  department?: string;
+  location?: string;
+  industry?: string;
+  jobCategory?: JobCategory;
+  channels: AlertChannel[];
+  isActive: boolean;
+  createdAt: Date;
+}
+
+export interface IAlertDocument extends IAlert, Document {
+  _id: Types.ObjectId;
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\types\company.types.ts =====
+import { Document, Types } from 'mongoose';
+
+export type ATSPlatform =
+  | 'greenhouse'
+  | 'lever'
+  | 'workday'
+  | 'icims'
+  | 'successfactors'
+  | 'ashby'
+  | 'custom';
+
+export type ScrapeStrategy = 'api' | 'playwright' | 'static';
+
+export interface ICompany {
+  name: string;
+  domain: string;
+  logoUrl: string;
+  careerUrl: string;
+  earlyCareerUrl: string;
+  industry: string;
+  atsPlatform: ATSPlatform;
+  scrapeStrategy: ScrapeStrategy;
+  activeJobCount: number;
+  lastScrapedAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface ICompanyDocument extends ICompany, Document {
+  _id: Types.ObjectId;
+}
+
+export interface IScrapeError {
+  company: string;
+  error: string;
+}
+
+export interface IScrapeLog {
+  runId: string;
+  startedAt: Date;
+  finishedAt?: Date;
+  companiesAttempted: number;
+  companiesSucceeded: number;
+  jobsScraped: number;
+  jobsAccepted: number;
+  jobsRejected: number;
+  errors: IScrapeError[];
+}
+
+export interface IScrapeLogDocument extends Omit<Document, 'errors'>, IScrapeLog {
+  _id: Types.ObjectId;
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\types\job.types.ts =====
+import { Document, Types } from 'mongoose';
+
+export type WorkModel = 'remote' | 'hybrid' | 'onsite';
+
+export type JobCategory = 'internship' | 'new_grad' | 'entry_level' | 'co_op' | 'rotational';
+
+export type InternshipSeason = 'summer' | 'fall' | 'spring' | 'year_round';
+
+export type AIClassification =
+  | 'internship'
+  | 'new_grad'
+  | 'entry_level'
+  | 'co_op'
+  | 'rotational'
+  | 'experienced';
+
+export interface IJob {
+  jobId: string;
+  jobTitle: string;
+  companyName: string;
+  companyId: Types.ObjectId;
+  companyLogoUrl: string;
+  industry: string;
+  location: string;
+  country: string;
+  workModel: WorkModel;
+  department: string;
+  jobCategory: JobCategory;
+  internshipSeason?: InternshipSeason;
+  applyUrl: string;
+  description: string;
+  descriptionSnippet: string;
+  sourcePlatform: string;
+  datePosted?: Date;
+  requiresUSWorkAuth?: boolean;
+  aiClassification: AIClassification;
+  aiConfidence: number;
+  classificationReason: string;
+  isExpired: boolean;
+  expiredAt?: Date;
+  lastSeen: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface IJobDocument extends IJob, Document {
+  _id: Types.ObjectId;
+}
+
+export interface ISavedJob {
+  userId: Types.ObjectId;
+  jobId: Types.ObjectId;
+  savedAt: Date;
+}
+
+export interface ISavedJobDocument extends ISavedJob, Document {
+  _id: Types.ObjectId;
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\types\notification.types.ts =====
+import { Document, Types } from 'mongoose';
+
+import { AlertChannel } from './alert.types';
+
+export type NotificationStatus = 'pending' | 'sent' | 'failed';
+
+export interface INotification {
+  userId: Types.ObjectId;
+  jobId?: Types.ObjectId;
+  channel: AlertChannel;
+  status: NotificationStatus;
+  error?: string;
+  sentAt?: Date;
+  isRead: boolean;
+  createdAt: Date;
+}
+
+export interface INotificationDocument extends INotification, Document {
+  _id: Types.ObjectId;
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\types\user.types.ts =====
+import { Document, Types } from 'mongoose';
+
+export type UserRole = 'user' | 'admin';
+export type AuthProvider = 'local' | 'google';
+
+export interface IUser {
+  name: string;
+  email: string;
+  passwordHash?: string;
+  provider: AuthProvider;
+  profileImage?: string;
+  telegramChatId?: string;
+  discordWebhookUrl?: string;
+  role: UserRole;
+  isActive: boolean;
+  isDeleted: boolean;
+  deletedAt?: Date;
+  lastLoginAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface IUserDocument extends IUser, Document {
+  _id: Types.ObjectId;
+  comparePassword(candidatePassword: string): Promise<boolean>;
+  softDelete(): Promise<IUserDocument>;
+  restore(): Promise<IUserDocument>;
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\utils\aiCache.ts =====
+import crypto from 'crypto';
+
+import { getRedisClient } from '@/config/redis';
+
+import { AIClassificationResult } from '../services/ai/ai.types';
+
+const CACHE_PREFIX = 'ai:class:';
+const CACHE_TTL = 60 * 60 * 24 * 30; // 30 days
+
+function hashJob(title: string, description: string): string {
+  return crypto
+    .createHash('sha256')
+    .update(`${title}||${description}`)
+    .digest('hex');
+}
+
+export class AiCache {
+  static async getClassification(
+    title: string,
+    description: string
+  ): Promise<AIClassificationResult | null> {
+    try {
+      const redis = getRedisClient();
+      const hash = hashJob(title, description);
+      const cached = await redis.get(`${CACHE_PREFIX}${hash}`);
+
+      if (cached) {
+        return JSON.parse(cached) as AIClassificationResult;
+      }
+      return null;
+    } catch (error) {
+      // Ignore cache errors, fallback to generating
+      return null;
+    }
+  }
+
+  static async setClassification(
+    title: string,
+    description: string,
+    result: AIClassificationResult
+  ): Promise<void> {
+    try {
+      const redis = getRedisClient();
+      const hash = hashJob(title, description);
+      await redis.setex(
+        `${CACHE_PREFIX}${hash}`,
+        CACHE_TTL,
+        JSON.stringify(result)
+      );
+    } catch (error) {
+      // Ignore cache errors
+    }
+  }
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\utils\asyncHandler.ts =====
+import { NextFunction, Request, Response } from 'express';
+
+type AsyncFunction = (req: Request, res: Response, next: NextFunction) => Promise<any>;
+
+/**
+ * Wrapper for async Express route handlers.
+ * Automatically catches any rejected promises and forwards them to the Express error handler (next).
+ */
+export const asyncHandler = (fn: AsyncFunction) => {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+};
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\utils\cookies.ts =====
+import { Response } from 'express';
+
+import { env } from '@/config/env';
+
+export const REFRESH_TOKEN_COOKIE_NAME = 'refreshToken';
+
+/**
+ * Sets the refresh token cookie in the response.
+ * @param res Express Response object.
+ * @param token The refresh token string.
+ */
+export function setRefreshTokenCookie(res: Response, token: string): void {
+  res.cookie(REFRESH_TOKEN_COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: env.NODE_ENV === 'production',
+    sameSite: 'strict',
+    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days in milliseconds
+  });
+}
+
+/**
+ * Clears the refresh token cookie in the response.
+ * @param res Express Response object.
+ */
+export function clearRefreshTokenCookie(res: Response): void {
+  res.clearCookie(REFRESH_TOKEN_COOKIE_NAME, {
+    httpOnly: true,
+    secure: env.NODE_ENV === 'production',
+    sameSite: 'strict',
+  });
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\utils\jwt.ts =====
+import jwt from 'jsonwebtoken';
+
+import { env } from '@/config/env';
+
+export interface JwtPayload {
+  userId: string;
+  email: string;
+  role: string;
+  iat?: number;
+  exp?: number;
+}
+
+export interface RefreshPayload {
+  userId: string;
+  iat?: number;
+  exp?: number;
+}
+
+/**
+ * Generates a signed Access JWT token.
+ * @param payload The token payload data.
+ * @returns The signed JWT string.
+ */
+export function generateAccessToken(payload: JwtPayload): string {
+  return jwt.sign(payload, env.JWT_ACCESS_SECRET, {
+    expiresIn: env.JWT_ACCESS_EXPIRES as jwt.SignOptions['expiresIn'],
+  });
+}
+
+/**
+ * Generates a signed Refresh JWT token.
+ * @param payload The token payload data (typically containing userId).
+ * @returns The signed JWT string.
+ */
+export function generateRefreshToken(payload: RefreshPayload): string {
+  return jwt.sign(payload, env.JWT_REFRESH_SECRET, {
+    expiresIn: env.JWT_REFRESH_EXPIRES as jwt.SignOptions['expiresIn'],
+  });
+}
+
+/**
+ * Verifies and decodes an Access JWT token.
+ * @param token The JWT string to verify.
+ * @returns The decoded payload.
+ */
+export function verifyAccessToken(token: string): JwtPayload {
+  return jwt.verify(token, env.JWT_ACCESS_SECRET) as JwtPayload;
+}
+
+/**
+ * Verifies and decodes a Refresh JWT token.
+ * @param token The JWT string to verify.
+ * @returns The decoded payload.
+ */
+export function verifyRefreshToken(token: string): RefreshPayload {
+  return jwt.verify(token, env.JWT_REFRESH_SECRET) as RefreshPayload;
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\utils\logger.ts =====
+import winston from 'winston';
+
+import { env } from '@/config/env';
+
+const { combine, timestamp, errors, json, colorize, simple } = winston.format;
+
+const developmentFormat = combine(
+  colorize({ all: true }),
+  timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+  errors({ stack: true }),
+  simple()
+);
+
+const productionFormat = combine(timestamp(), errors({ stack: true }), json());
+
+export const logger = winston.createLogger({
+  level: env.LOG_LEVEL || (env.NODE_ENV === 'production' ? 'warn' : 'debug'),
+  format: env.NODE_ENV === 'production' ? productionFormat : developmentFormat,
+  defaultMeta: { service: 'jobs-platform-api' },
+  transports: [
+    new winston.transports.Console(),
+    ...(env.NODE_ENV === 'production'
+      ? [
+          new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
+          new winston.transports.File({ filename: 'logs/combined.log' }),
+        ]
+      : []),
+  ],
+  exitOnError: false,
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\utils\password.ts =====
+import bcrypt from 'bcryptjs';
+
+/**
+ * Hashes a plaintext password using bcrypt.
+ * @param password The plaintext password to hash.
+ * @returns A promise that resolves to the hashed password.
+ */
+export async function hashPassword(password: string): Promise<string> {
+  const salt = await bcrypt.genSalt(12);
+  return bcrypt.hash(password, salt);
+}
+
+/**
+ * Compares a plaintext password with a hash.
+ * @param password The plaintext password to verify.
+ * @param hash The hashed password to compare against.
+ * @returns A promise that resolves to true if they match, false otherwise.
+ */
+export async function comparePassword(password: string, hash: string): Promise<boolean> {
+  return bcrypt.compare(password, hash);
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\utils\response.ts =====
+import { Response } from 'express';
+
+export interface ApiResponse<T = unknown> {
+  success: boolean;
+  data?: T;
+  message?: string;
+  error?: string;
+  meta?: Record<string, unknown>;
+}
+
+export interface PaginatedMeta {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+  hasNextPage: boolean;
+  hasPrevPage: boolean;
+}
+
+export function sendSuccess<T>(
+  res: Response,
+  data: T,
+  message?: string,
+  statusCode = 200,
+  meta?: Record<string, unknown>
+): Response {
+  const response: ApiResponse<T> = {
+    success: true,
+    data,
+    ...(message && { message }),
+    ...(meta && { meta }),
+  };
+  return res.status(statusCode).json(response);
+}
+
+export function sendCreated<T>(res: Response, data: T, message?: string): Response {
+  return sendSuccess(res, data, message ?? 'Created successfully', 201);
+}
+
+export function sendError(
+  res: Response,
+  message: string,
+  statusCode = 500,
+  error?: string
+): Response {
+  const response: ApiResponse = {
+    success: false,
+    message,
+    ...(error && { error }),
+  };
+  return res.status(statusCode).json(response);
+}
+
+export function sendPaginated<T>(
+  res: Response,
+  data: T[],
+  paginationMeta: PaginatedMeta,
+  message?: string
+): Response {
+  return sendSuccess(res, data, message, 200, paginationMeta as unknown as Record<string, unknown>);
+}
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\validators\alert.validator.ts =====
+import { z } from 'zod';
+
+export const createAlertSchema = z.object({
+  body: z.object({
+    company: z.string().trim().optional(),
+    department: z.string().trim().optional(),
+    location: z.string().trim().optional(),
+    industry: z.string().trim().optional(),
+    jobCategory: z
+      .enum(['internship', 'new_grad', 'entry_level', 'co_op', 'rotational'])
+      .optional(),
+    channels: z
+      .array(z.enum(['email', 'telegram', 'discord']))
+      .min(1, 'At least one notification channel is required'),
+    isActive: z.boolean().optional(),
+  }),
+});
+
+export const updateAlertSchema = z.object({
+  params: z.object({
+    alertId: z.string().regex(/^[0-9a-fA-F]{24}$/, 'Invalid alert ID format'),
+  }),
+  body: z.object({
+    company: z.string().trim().optional(),
+    department: z.string().trim().optional(),
+    location: z.string().trim().optional(),
+    industry: z.string().trim().optional(),
+    jobCategory: z
+      .enum(['internship', 'new_grad', 'entry_level', 'co_op', 'rotational'])
+      .optional()
+      .nullable(),
+    channels: z
+      .array(z.enum(['email', 'telegram', 'discord']))
+      .min(1, 'At least one notification channel is required')
+      .optional(),
+    isActive: z.boolean().optional(),
+  }),
+});
+
+export type CreateAlertInput = z.infer<typeof createAlertSchema>;
+export type UpdateAlertInput = z.infer<typeof updateAlertSchema>;
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\validators\auth.validator.ts =====
+import { z } from 'zod';
+
+// Password pattern: min 8 characters, at least 1 uppercase, 1 lowercase, 1 number, 1 special character
+const passwordRegex =
+  /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+=[\]{};':",./<>?|\\`~-]).{8,}$/;
+
+export const registerSchema = z.object({
+  body: z.object({
+    name: z
+      .string({ required_error: 'Name is required' })
+      .min(2, 'Name must be at least 2 characters')
+      .max(50, 'Name must not exceed 50 characters')
+      .trim(),
+
+    email: z
+      .string({ required_error: 'Email is required' })
+      .email('Please enter a valid email address')
+      .toLowerCase()
+      .trim(),
+
+    password: z
+      .string({ required_error: 'Password is required' })
+      .min(8, 'Password must be at least 8 characters')
+      .regex(
+        passwordRegex,
+        'Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character'
+      ),
+  }),
+});
+
+export const loginSchema = z.object({
+  body: z.object({
+    email: z
+      .string({ required_error: 'Email is required' })
+      .email('Please enter a valid email address')
+      .toLowerCase()
+      .trim(),
+
+    password: z.string({ required_error: 'Password is required' }),
+  }),
+});
+
+export const googleAuthSchema = z.object({
+  body: z.object({
+    credential: z
+      .string({ required_error: 'Google credential is required' })
+      .min(1, 'Google credential token cannot be empty'),
+  }),
+});
+
+export const updateProfileSchema = z.object({
+  body: z.object({
+    name: z
+      .string()
+      .min(2, 'Name must be at least 2 characters')
+      .max(50, 'Name must not exceed 50 characters')
+      .trim()
+      .optional(),
+
+    profileImage: z.string().url('Profile image must be a valid URL').or(z.literal('')).optional(),
+
+    telegramChatId: z.string().trim().optional(),
+
+    discordWebhookUrl: z
+      .string()
+      .url('Discord webhook must be a valid URL')
+      .or(z.literal(''))
+      .optional(),
+  }),
+});
+
+export type RegisterInput = z.infer<typeof registerSchema>;
+export type LoginInput = z.infer<typeof loginSchema>;
+export type GoogleAuthInput = z.infer<typeof googleAuthSchema>;
+export type UpdateProfileInput = z.infer<typeof updateProfileSchema>;
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\validators\job.validator.ts =====
+import { z } from 'zod';
+
+export const searchJobsSchema = z.object({
+  query: z.object({
+    keyword: z.string().trim().optional(),
+    company: z.string().trim().optional(),
+    location: z.string().trim().optional(),
+    workModel: z
+      .union([
+        z.enum(['remote', 'hybrid', 'onsite']),
+        z
+          .string()
+          .transform((val) => val.split(','))
+          .pipe(z.array(z.enum(['remote', 'hybrid', 'onsite']))),
+      ])
+      .optional(),
+    jobCategory: z
+      .union([
+        z.enum(['internship', 'new_grad', 'entry_level', 'co_op', 'rotational']),
+        z
+          .string()
+          .transform((val) => val.split(','))
+          .pipe(z.array(z.enum(['internship', 'new_grad', 'entry_level', 'co_op', 'rotational']))),
+      ])
+      .optional(),
+    internshipSeason: z
+      .union([
+        z.enum(['summer', 'fall', 'spring', 'year_round']),
+        z
+          .string()
+          .transform((val) => val.split(','))
+          .pipe(z.array(z.enum(['summer', 'fall', 'spring', 'year_round']))),
+      ])
+      .optional(),
+    department: z.string().trim().optional(),
+    industry: z.string().trim().optional(),
+    dateRange: z.enum(['today', 'week', 'month']).optional(),
+    page: z.coerce.number().int().positive().default(1),
+    limit: z.coerce.number().int().positive().max(100).default(20),
+  }),
+});
+
+export type SearchJobsInput = z.infer<typeof searchJobsSchema>;
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\validators\savedJob.validator.ts =====
+import { z } from 'zod';
+
+export const saveJobSchema = z.object({
+  params: z.object({
+    id: z.string().regex(/^[0-9a-fA-F]{24}$/, 'Invalid job ID format'),
+  }),
+});
+
+export type SaveJobInput = z.infer<typeof saveJobSchema>;
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\workers\classification.worker.ts =====
+import { Worker, Job as BullJob } from 'bullmq';
+
+import { QUEUE_NAMES } from '@/config/bullmq';
+import { getRedisClient } from '@/config/redis';
+import { Job } from '@/models/Job.model';
+import { classifierService } from '@/services/ai/classifier.service';
+import { logger } from '@/utils/logger';
+
+import { ClassificationJobPayload } from '../queues/classification.queue';
+
+export const classificationWorker = new Worker<ClassificationJobPayload>(
+  QUEUE_NAMES.CLASSIFICATION,
+  async (job: BullJob<ClassificationJobPayload>) => {
+    const { jobId, companyName } = job.data;
+    logger.info(`Processing classification for ${companyName} - ${jobId}`);
+
+    // 1. Fetch Job from MongoDB
+    const dbJob = await Job.findOne({ jobId, companyName });
+    if (!dbJob) {
+      logger.warn(`Job not found in DB: ${jobId} - ${companyName}`);
+      return;
+    }
+
+    if (!dbJob.description) {
+      logger.warn(`Job ${jobId} has no description`);
+      return;
+    }
+
+    // 2. Call AI Classifier
+    const result = await classifierService.classifyJob(
+      dbJob.jobTitle,
+      dbJob.description
+    );
+
+    // 3. Update DB
+    dbJob.aiClassification = result.classification;
+    dbJob.aiConfidence = result.confidence;
+    dbJob.classificationReason = result.reason;
+
+    // 4. Rejection Rule: if experienced & confidence > 0.8 => expired
+    if (result.classification === 'experienced' && result.confidence > 0.8) {
+      logger.info(
+        `Job ${jobId} identified as experienced with high confidence. Marking as expired.`
+      );
+      dbJob.isExpired = true;
+      dbJob.expiredAt = new Date();
+    }
+
+    await dbJob.save();
+    logger.info(`Successfully classified job ${jobId} as ${result.classification}`);
+
+    // 5. Trigger notifications for active early career jobs
+    if (!dbJob.isExpired) {
+      const { addJobToNotificationQueue } = await import('../queues/notification.queue');
+      await addJobToNotificationQueue({
+        jobId: dbJob.jobId,
+        companyName: dbJob.companyName,
+      });
+    }
+  },
+  {
+    connection: getRedisClient() as any,
+    concurrency: 5,
+  }
+);
+
+classificationWorker.on('completed', (job) => {
+  logger.debug(`Classification job completed: ${job.id}`);
+});
+
+classificationWorker.on('failed', (job, err) => {
+  logger.error(
+    `Classification job failed for ${job?.data.companyName} - ${job?.data.jobId}:`,
+    err.message
+  );
+});
+===== C:\Users\PRATHAM\OneDrive\Desktop\jobs\backend\src\workers\notification.worker.ts =====
+import { Worker, Job as BullJob } from 'bullmq';
+
+import { QUEUE_NAMES } from '@/config/bullmq';
+import { getRedisClient } from '@/config/redis';
+import { Job } from '@/models/Job.model';
+import { Notification } from '@/models/Notification.model';
+import { logger } from '@/utils/logger';
+import { matchAlertsForJob } from '@/modules/alerts/alerts.matcher';
+
+import { emailService } from '@/services/channels/email.service';
+import { telegramService } from '@/services/channels/telegram.service';
+import { discordService } from '@/services/channels/discord.service';
+
+import { NotificationJobPayload } from '../queues/notification.queue';
+
+export const notificationWorker = new Worker<NotificationJobPayload>(
+  QUEUE_NAMES.NOTIFICATIONS,
+  async (job: BullJob<NotificationJobPayload>) => {
+    const { jobId, companyName } = job.data;
+    logger.info(`Processing notifications for ${companyName} - ${jobId}`);
+
+    const dbJob = await Job.findOne({ jobId, companyName });
+    if (!dbJob) {
+      logger.warn(`Job not found in DB: ${jobId} - ${companyName}`);
+      return;
+    }
+
+    if (dbJob.isExpired) {
+      logger.info(`Job ${jobId} is expired, skipping notifications`);
+      return;
+    }
+
+    const matchedUsers = await matchAlertsForJob(dbJob);
+    logger.info(`Found ${matchedUsers.length} users to notify for job ${jobId}`);
+
+    for (const match of matchedUsers) {
+      for (const channel of match.channels) {
+        try {
+          // Attempt to create the Notification record to prevent duplicates
+          const notificationDoc = new Notification({
+            userId: match.user._id,
+            jobId: dbJob._id,
+            channel,
+            status: 'pending',
+          });
+          
+          await notificationDoc.save();
+
+          // Dispatch notification
+          try {
+            if (channel === 'email' && match.user.email) {
+              const html = `
+                <h2>New Job Alert \ud83d\ude80</h2>
+                <p><strong>Title:</strong> ${dbJob.jobTitle}</p>
+                <p><strong>Company:</strong> ${dbJob.companyName}</p>
+                <p><strong>Location:</strong> ${dbJob.location}</p>
+                <p><a href="${dbJob.applyUrl}">Apply Here</a></p>
+              `;
+              await emailService.sendEmail(match.user.email, `New ${dbJob.jobCategory} at ${dbJob.companyName}`, html);
+            } else if (channel === 'telegram' && match.user.telegramChatId) {
+              const text = `<b>New Job Alert \ud83d\ude80</b>\n\n<b>Title:</b> ${dbJob.jobTitle}\n<b>Company:</b> ${dbJob.companyName}\n<b>Location:</b> ${dbJob.location}\n<a href="${dbJob.applyUrl}">Apply Here</a>`;
+              await telegramService.sendMessage(match.user.telegramChatId, text);
+            } else if (channel === 'discord' && match.user.discordWebhookUrl) {
+              await discordService.sendWebhook(match.user.discordWebhookUrl, 'New Job Alert \ud83d\ude80', [
+                {
+                  title: dbJob.jobTitle,
+                  url: dbJob.applyUrl,
+                  author: { name: dbJob.companyName },
+                  description: dbJob.descriptionSnippet,
+                  fields: [
+                    { name: 'Location', value: dbJob.location, inline: true },
+                    { name: 'Category', value: dbJob.jobCategory, inline: true }
+                  ]
+                }
+              ]);
+            } else {
+              // Channel selected but missing user details (e.g. email or telegramChatId)
+              logger.warn(`User ${match.user._id} selected ${channel} but is missing required configuration`);
+              notificationDoc.status = 'failed';
+              notificationDoc.error = `Missing user configuration for ${channel}`;
+              await notificationDoc.save();
+              continue;
+            }
+
+            notificationDoc.status = 'sent';
+            notificationDoc.sentAt = new Date();
+            await notificationDoc.save();
+          } catch (dispatchErr: any) {
+            notificationDoc.status = 'failed';
+            notificationDoc.error = dispatchErr.message;
+            await notificationDoc.save();
+            throw dispatchErr; // BullMQ will retry
+          }
+        } catch (err: any) {
+          // If error is duplicate key error (code 11000), it means we already sent it.
+          if (err.code === 11000) {
+            logger.debug(`Notification already exists for user ${match.user._id}, job ${jobId}, channel ${channel}`);
+            continue;
+          }
+          throw err;
+        }
+      }
+    }
+  },
+  {
+    connection: getRedisClient() as any,
+    concurrency: 5,
+  }
+);
+
+notificationWorker.on('completed', (job) => {
+  logger.debug(`Notification job completed: ${job.id}`);
+});
+
+notificationWorker.on('failed', (job, err) => {
+  logger.error(
+    `Notification job failed for ${job?.data.companyName} - ${job?.data.jobId}:`,
+    err.message
+  );
+});

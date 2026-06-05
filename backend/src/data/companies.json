@@ -1,0 +1,12 @@
+[
+  {
+    "name": "Amazon",
+    "domain": "amazon.com",
+    "logoUrl": "https://logo.clearbit.com/amazon.com",
+    "careerUrl": "https://www.amazon.jobs",
+    "earlyCareerUrl": "https://www.amazon.jobs/en/teams/student-programs",
+    "industry": "Technology",
+    "atsPlatform": "custom",
+    "scrapeStrategy": "api"
+  }
+]

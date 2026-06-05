@@ -1,0 +1,89 @@
+@import "tailwindcss";
+@config "../../tailwind.config.js";
+
+@layer base {
+  :root {
+    --color-primary: #cc785c;
+    --color-primary-active: #a9583e;
+    --color-primary-disabled: #e6dfd8;
+    --color-ink: #141413;
+    --color-body: #3d3d3a;
+    --color-body-strong: #252523;
+    --color-muted: #6c6a64;
+    --color-muted-soft: #8e8b82;
+    --color-hairline: #e6dfd8;
+    --color-hairline-soft: #ebe6df;
+    --color-canvas: #faf9f5;
+    --color-surface-soft: #f5f0e8;
+    --color-surface-card: #efe9de;
+    --color-surface-cream-strong: #e8e0d2;
+    --color-surface-dark: #181715;
+    --color-surface-dark-elevated: #252320;
+    --color-surface-dark-soft: #1f1e1b;
+    --color-on-primary: #ffffff;
+    --color-on-dark: #faf9f5;
+    --color-on-dark-soft: #a09d96;
+    --color-accent-teal: #5db8a6;
+    --color-accent-amber: #e8a55a;
+    --color-success: #5db872;
+    --color-warning: #d4a017;
+    --color-error: #c64545;
+  }
+
+  body {
+    @apply bg-canvas text-body font-sans;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-display text-ink tracking-tight;
+  }
+}
+
+@layer components {
+  /* Buttons */
+  .btn {
+    @apply inline-flex items-center justify-center font-sans font-medium rounded-md px-5 h-10 transition-colors focus:outline-none focus:ring-2 focus:ring-primary/50 disabled:opacity-50 disabled:pointer-events-none;
+  }
+  .btn-primary {
+    @apply bg-primary text-on-primary hover:bg-primary-active active:bg-primary-active;
+  }
+  .btn-secondary {
+    @apply bg-canvas text-ink border border-hairline hover:bg-surface-soft active:bg-surface-soft;
+  }
+  .btn-secondary-dark {
+    @apply bg-surface-dark-elevated text-on-dark hover:bg-surface-dark-soft;
+  }
+  .btn-text {
+    @apply inline-flex items-center justify-center font-sans font-medium text-primary bg-transparent hover:underline px-2 h-auto focus:outline-none;
+  }
+  .btn-icon {
+    @apply inline-flex items-center justify-center bg-canvas text-ink rounded-full border border-hairline w-9 h-9 hover:bg-surface-soft transition-colors;
+  }
+
+  /* Cards */
+  .card-feature {
+    @apply bg-surface-card text-ink rounded-lg p-xl;
+  }
+  .card-dark {
+    @apply bg-surface-dark text-on-dark rounded-lg p-xl;
+  }
+  .card-code {
+    @apply bg-surface-dark text-on-dark font-mono rounded-lg p-lg;
+  }
+  .card-coral {
+    @apply bg-primary text-on-primary rounded-lg p-xxl;
+  }
+
+  /* Inputs */
+  .input-text {
+    @apply bg-canvas text-ink font-sans text-base rounded-md border border-hairline px-[14px] h-10 w-full focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/15 transition-all;
+  }
+
+  /* Badges */
+  .badge-pill {
+    @apply inline-flex items-center justify-center bg-surface-card text-ink font-sans text-[13px] font-medium rounded-pill px-3 py-1;
+  }
+  .badge-coral {
+    @apply inline-flex items-center justify-center bg-primary text-on-primary font-sans text-[12px] font-medium tracking-[1.5px] uppercase rounded-pill px-3 py-1;
+  }
+}
