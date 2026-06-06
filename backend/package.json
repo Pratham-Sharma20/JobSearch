@@ -6,7 +6,6 @@
   "main": "dist/server.js",
   "scripts": {
     "dev": "tsx watch src/dev.ts",
-    "scrape:cli": "tsx src/scrape-cli.ts",
     "build": "tsc --project tsconfig.json",
     "start": "node dist/server.js",
     "lint": "eslint src --ext .ts --fix",
