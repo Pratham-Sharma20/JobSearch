@@ -11,13 +11,14 @@ import { IcimsScraper } from './ats/icims.scraper';
 import { SuccessFactorsScraper } from './ats/successfactors.scraper';
 import { CustomScraper } from './ats/custom.scraper';
 import { isEarlyCareer } from './filters/relevance.filter';
+import { detectATS, ATSPlatform } from './utils/atsDetector';
 import { normalizeJob } from './utils/normalizeJob';
 import { withRetry } from './utils/retry';
 import { scraperLogger } from './utils/logger';
 import { RawJob } from './base/scraper.types';
 import { addJobToClassificationQueue } from '../queues/classification.queue';
 
-const CONCURRENCY_LIMIT = 3;
+const CONCURRENCY_LIMIT = 5;
 
 function randomDelay(min: number, max: number) {
   return new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1) + min)));
@@ -84,9 +85,16 @@ export class ScraperManager {
             });
           }
 
-          const scraper = this.scrapers[companyData.atsPlatform];
+          let atsPlatform = companyData.atsPlatform;
+
+          if (!atsPlatform || atsPlatform === 'unknown') {
+            atsPlatform = await detectATS(companyData.careerUrl);
+            scraperLogger.info(`Detected ATS for ${companyData.name}: ${atsPlatform}`);
+          }
+
+          const scraper = this.scrapers[atsPlatform];
           if (!scraper) {
-            scraperLogger.warn(`No scraper found for ${companyData.atsPlatform} (Company: ${companyData.name})`);
+            scraperLogger.warn(`No scraper found for ${atsPlatform} (Company: ${companyData.name})`);
             return;
           }
 
