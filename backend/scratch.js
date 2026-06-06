@@ -1,19 +1,16 @@
-const axios = require('axios');
-
-async function testApis() {
-  // Amazon
-  try {
-    const amzn = await axios.get('https://www.amazon.jobs/en/search.json?offset=0&result_limit=10&sort=recent');
-    console.log('Amazon Jobs:', amzn.data.jobs ? amzn.data.jobs.length : 0);
-    console.log('Sample Amazon Job:', amzn.data.jobs[0].title, amzn.data.jobs[0].url_next_step);
-  } catch (e) { console.log('Amazon error', e.message); }
-
-  // Google
-  try {
-    const goog = await axios.get('https://careers.google.com/api/v3/search/?distance=50&q=Software%20Engineer');
-    console.log('Google Jobs:', goog.data.jobs ? goog.data.jobs.length : 0);
-  } catch (e) { console.log('Google error', e.message); }
-
-}
-
-testApis();
+const fs = require('fs');
+const files = [
+  'src/modules/saved-jobs/savedJobs.test.ts',
+  'src/modules/notifications/notification.test.ts',
+  'src/modules/jobs/jobs.test.ts',
+  'src/modules/companies/companies.test.ts',
+  'src/modules/auth/auth.test.ts',
+  'src/modules/alerts/alerts.test.ts'
+];
+files.forEach(f => {
+  let content = fs.readFileSync(f, 'utf-8');
+  content = content.replace(/vi\.mock\('bullmq'[\s\S]*?\)\);\r?\n/g, '');
+  content = content.replace(/vi\.mock\('ioredis'[\s\S]*?\)\);\r?\n/g, '');
+  content = content.replace(/\/\/ Mocks to prevent Redis\/BullMQ\/Typesense from trying to connect\r?\n/g, '// Mocks to prevent Typesense from trying to connect\n');
+  fs.writeFileSync(f, content);
+});

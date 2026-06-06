@@ -1,4 +1,3 @@
-import { ScraperManager } from './scrapers/scraper.manager';
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 
@@ -15,6 +14,9 @@ async function runCliScraper() {
   try {
     await mongoose.connect(process.env.MONGODB_URI);
     console.log('Connected to MongoDB');
+
+    // Dynamically import ScraperManager
+    const { ScraperManager } = await import('./scrapers/scraper.manager');
 
     const manager = new ScraperManager();
     const result = await manager.run();
@@ -38,6 +40,7 @@ async function runCliScraper() {
   } finally {
     await mongoose.disconnect();
     console.log('Disconnected from MongoDB');
+    
     process.exit(0);
   }
 }

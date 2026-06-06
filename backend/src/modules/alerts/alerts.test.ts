@@ -8,8 +8,6 @@ import { User } from '../../models/User.model';
 import { Alert } from '../../models/Alert.model';
 import { generateAccessToken } from '../../utils/jwt';
 
-vi.mock('bullmq', () => ({ Queue: vi.fn(), Worker: vi.fn() }));
-vi.mock('ioredis', () => ({ default: vi.fn() }));
 vi.mock('typesense', () => ({ default: { Client: vi.fn() }, Client: vi.fn() }));
 
 describe('Alerts API Tests', () => {

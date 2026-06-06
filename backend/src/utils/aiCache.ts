@@ -1,11 +1,8 @@
 import crypto from 'crypto';
-
-import { getRedisClient } from '@/config/redis';
-
 import { AIClassificationResult } from '../services/ai/ai.types';
 
 const CACHE_PREFIX = 'ai:class:';
-const CACHE_TTL = 60 * 60 * 24 * 30; // 30 days
+const memoryCache = new Map<string, string>();
 
 function hashJob(title: string, description: string): string {
   return crypto
@@ -20,16 +17,14 @@ export class AiCache {
     description: string
   ): Promise<AIClassificationResult | null> {
     try {
-      const redis = getRedisClient();
       const hash = hashJob(title, description);
-      const cached = await redis.get(`${CACHE_PREFIX}${hash}`);
+      const cached = memoryCache.get(`${CACHE_PREFIX}${hash}`);
 
       if (cached) {
         return JSON.parse(cached) as AIClassificationResult;
       }
       return null;
     } catch (error) {
-      // Ignore cache errors, fallback to generating
       return null;
     }
   }
@@ -40,11 +35,9 @@ export class AiCache {
     result: AIClassificationResult
   ): Promise<void> {
     try {
-      const redis = getRedisClient();
       const hash = hashJob(title, description);
-      await redis.setex(
+      memoryCache.set(
         `${CACHE_PREFIX}${hash}`,
-        CACHE_TTL,
         JSON.stringify(result)
       );
     } catch (error) {

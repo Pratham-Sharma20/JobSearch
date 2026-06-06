@@ -1,7 +1,3 @@
-import { Worker, Job as BullJob } from 'bullmq';
-
-import { QUEUE_NAMES } from '@/config/bullmq';
-import { getRedisClient } from '@/config/redis';
 import { Job } from '@/models/Job.model';
 import { Notification } from '@/models/Notification.model';
 import { logger } from '@/utils/logger';
@@ -11,14 +7,10 @@ import { emailService } from '@/services/channels/email.service';
 import { telegramService } from '@/services/channels/telegram.service';
 import { discordService } from '@/services/channels/discord.service';
 
-import { NotificationJobPayload } from '../queues/notification.queue';
+export async function processNotificationJob(jobId: string, companyName: string) {
+  logger.info(`Processing notifications for ${companyName} - ${jobId}`);
 
-export const notificationWorker = new Worker<NotificationJobPayload>(
-  QUEUE_NAMES.NOTIFICATIONS,
-  async (job: BullJob<NotificationJobPayload>) => {
-    const { jobId, companyName } = job.data;
-    logger.info(`Processing notifications for ${companyName} - ${jobId}`);
-
+  try {
     const dbJob = await Job.findOne({ jobId, companyName });
     if (!dbJob) {
       logger.warn(`Job not found in DB: ${jobId} - ${companyName}`);
@@ -52,7 +44,7 @@ export const notificationWorker = new Worker<NotificationJobPayload>(
           try {
             if (channel === 'email' && match.user.email) {
               const html = `
-                <h2>New Job Alert \ud83d\ude80</h2>
+                <h2>New Job Alert 🚀</h2>
                 <p><strong>Title:</strong> ${dbJob.jobTitle}</p>
                 <p><strong>Company:</strong> ${dbJob.companyName}</p>
                 <p><strong>Location:</strong> ${dbJob.location}</p>
@@ -60,10 +52,10 @@ export const notificationWorker = new Worker<NotificationJobPayload>(
               `;
               await emailService.sendEmail(match.user.email, `New ${dbJob.jobCategory} at ${dbJob.companyName}`, html);
             } else if (channel === 'telegram' && match.user.telegramChatId) {
-              const text = `<b>New Job Alert \ud83d\ude80</b>\n\n<b>Title:</b> ${dbJob.jobTitle}\n<b>Company:</b> ${dbJob.companyName}\n<b>Location:</b> ${dbJob.location}\n<a href="${dbJob.applyUrl}">Apply Here</a>`;
+              const text = `<b>New Job Alert 🚀</b>\n\n<b>Title:</b> ${dbJob.jobTitle}\n<b>Company:</b> ${dbJob.companyName}\n<b>Location:</b> ${dbJob.location}\n<a href="${dbJob.applyUrl}">Apply Here</a>`;
               await telegramService.sendMessage(match.user.telegramChatId, text);
             } else if (channel === 'discord' && match.user.discordWebhookUrl) {
-              await discordService.sendWebhook(match.user.discordWebhookUrl, 'New Job Alert \ud83d\ude80', [
+              await discordService.sendWebhook(match.user.discordWebhookUrl, 'New Job Alert 🚀', [
                 {
                   title: dbJob.jobTitle,
                   url: dbJob.applyUrl,
@@ -91,27 +83,15 @@ export const notificationWorker = new Worker<NotificationJobPayload>(
             notificationDoc.status = 'failed';
             notificationDoc.error = dispatchErr.message;
             await notificationDoc.save();
-            throw dispatchErr; // BullMQ will retry
+            logger.error(`Failed dispatching ${channel} to user ${match.user._id}: ${dispatchErr.message}`);
           }
         } catch (err: any) {
-          throw err;
+          logger.error(`Error saving notification doc: ${err.message}`);
         }
       }
     }
-  },
-  {
-    connection: getRedisClient() as any,
-    concurrency: 5,
+    logger.debug(`Notification job completed for: ${jobId}`);
+  } catch (err: any) {
+    logger.error(`Notification job failed for ${companyName} - ${jobId}: ${err.message}`);
   }
-);
-
-notificationWorker.on('completed', (job) => {
-  logger.debug(`Notification job completed: ${job.id}`);
-});
-
-notificationWorker.on('failed', (job, err) => {
-  logger.error(
-    `Notification job failed for ${job?.data.companyName} - ${job?.data.jobId}:`,
-    err.message
-  );
-});
+}

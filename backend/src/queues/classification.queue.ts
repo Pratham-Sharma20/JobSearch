@@ -1,4 +1,3 @@
-import { classificationQueue } from '@/config/bullmq';
 import { logger } from '@/utils/logger';
 
 export interface ClassificationJobPayload {
@@ -10,15 +9,16 @@ export async function addJobToClassificationQueue(
   payload: ClassificationJobPayload
 ) {
   try {
-    await classificationQueue.add('classifyJob', payload, {
-      jobId: `${payload.jobId}-${payload.companyName}`,
-      removeOnComplete: true,
-      removeOnFail: false,
+    logger.info(`Triggering background classification for ${payload.jobId} from ${payload.companyName}`);
+    
+    // Dynamic import to avoid circular dependencies
+    const { processClassificationJob } = await import('../workers/classification.worker');
+    
+    // Execute asynchronously (fire-and-forget)
+    processClassificationJob(payload.jobId, payload.companyName).catch((err) => {
+      logger.error('Background classification job failed:', err);
     });
-    logger.info(
-      `Added job ${payload.jobId} from ${payload.companyName} to classification queue`
-    );
   } catch (error: any) {
-    logger.error('Failed to add job to classification queue:', error.message);
+    logger.error('Failed to trigger background classification:', error.message);
   }
 }

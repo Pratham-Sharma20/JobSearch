@@ -1,4 +1,3 @@
-import { notificationsQueue } from '@/config/bullmq';
 import { logger } from '@/utils/logger';
 
 export interface NotificationJobPayload {
@@ -6,15 +5,20 @@ export interface NotificationJobPayload {
   companyName: string;
 }
 
-export const addJobToNotificationQueue = async (
+export async function addJobToNotificationQueue(
   payload: NotificationJobPayload
-): Promise<void> => {
+) {
   try {
-    await notificationsQueue.add('sendNotifications', payload, {
-      jobId: `notify-${payload.companyName}-${payload.jobId}`,
+    logger.info(`Triggering background notification for ${payload.jobId} from ${payload.companyName}`);
+    
+    // Dynamic import to avoid circular dependencies
+    const { processNotificationJob } = await import('../workers/notification.worker');
+    
+    // Execute asynchronously (fire-and-forget)
+    processNotificationJob(payload.jobId, payload.companyName).catch((err) => {
+      logger.error('Background notification job failed:', err);
     });
-    logger.debug(`Added job ${payload.jobId} to notifications queue`);
-  } catch (error) {
-    logger.error(`Failed to add job ${payload.jobId} to notifications queue:`, error);
+  } catch (error: any) {
+    logger.error('Failed to trigger background notification:', error.message);
   }
-};
+}

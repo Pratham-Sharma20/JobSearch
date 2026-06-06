@@ -7,7 +7,6 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 
 import { env } from '@/config/env';
-import { connectRedis, redisClient } from '@/config/redis';
 import { initTypesenseCollections } from '@/config/typesense';
 import { connectDB, closeDB } from '@/database/connectDB';
 import { initIndexes } from '@/database/indexes';
@@ -81,16 +80,14 @@ app.use(globalRateLimiter);
 // Health Check
 app.get('/health', async (_req: Request, res: Response) => {
   const dbStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
-  const redisStatus = redisClient?.status === 'ready' ? 'connected' : 'disconnected';
   
   res.status(200).json({
-    status: dbStatus === 'connected' && redisStatus === 'connected' ? 'ok' : 'degraded',
+    status: dbStatus === 'connected' ? 'ok' : 'degraded',
     timestamp: new Date(),
     uptime: process.uptime(),
     version: process.env.npm_package_version || '1.0.0',
     services: {
-      mongodb: dbStatus,
-      redis: redisStatus
+      mongodb: dbStatus
     }
   });
 });
@@ -149,13 +146,7 @@ async function startServer(): Promise<void> {
     // 2. Synchronize database indexes
     await initIndexes();
 
-    // 3. Initialize Redis connection gracefully (defensive check)
-    try {
-      await connectRedis();
-      logger.info('✅ Redis connection initialized successfully');
-    } catch (err: any) {
-      logger.warn(`⚠️  Failed to connect to Redis: ${err.message}`);
-    }
+    // 3. (Removed Redis Initialization)
 
     // 4. Initialize Typesense collections gracefully (defensive check)
     try {
@@ -181,10 +172,6 @@ async function startServer(): Promise<void> {
           });
         }
         await closeDB();
-        if (redisClient) {
-          await redisClient.quit();
-          logger.info('Redis connection closed.');
-        }
         process.exit(0);
       };
 

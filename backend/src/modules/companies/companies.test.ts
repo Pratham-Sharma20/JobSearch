@@ -7,8 +7,6 @@ import { app } from '../../server';
 import { Job } from '../../models/Job.model';
 import { Company } from '../../models/Company.model';
 
-vi.mock('bullmq', () => ({ Queue: vi.fn(), Worker: vi.fn() }));
-vi.mock('ioredis', () => ({ default: vi.fn() }));
 vi.mock('typesense', () => ({ default: { Client: vi.fn() }, Client: vi.fn() }));
 
 describe('Companies API Tests', () => {

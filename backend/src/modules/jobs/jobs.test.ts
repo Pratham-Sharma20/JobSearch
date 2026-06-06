@@ -7,18 +7,8 @@ import { app } from '../../server';
 import { Job } from '../../models/Job.model';
 import { Company } from '../../models/Company.model';
 
-// Mocks to prevent Redis/BullMQ/Typesense from trying to connect
-vi.mock('bullmq', () => ({
-  Queue: vi.fn().mockImplementation(() => ({ add: vi.fn(), close: vi.fn().mockResolvedValue(undefined) })),
-  Worker: vi.fn().mockImplementation(() => ({ on: vi.fn(), close: vi.fn().mockResolvedValue(undefined) })),
-}));
+// Mocks to prevent Typesense from trying to connect
 
-vi.mock('ioredis', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    on: vi.fn(), connect: vi.fn().mockResolvedValue(undefined),
-    quit: vi.fn().mockResolvedValue(undefined), disconnect: vi.fn().mockResolvedValue(undefined),
-  })),
-}));
 
 vi.mock('typesense', () => {
   const Client = function (this: any) {

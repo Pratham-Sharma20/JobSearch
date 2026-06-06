@@ -1,19 +1,11 @@
-import { Worker, Job as BullJob } from 'bullmq';
-
-import { QUEUE_NAMES } from '@/config/bullmq';
-import { getRedisClient } from '@/config/redis';
 import { Job } from '@/models/Job.model';
 import { classifierService } from '@/services/ai/classifier.service';
 import { logger } from '@/utils/logger';
 
-import { ClassificationJobPayload } from '../queues/classification.queue';
+export async function processClassificationJob(jobId: string, companyName: string) {
+  logger.info(`Processing classification for ${companyName} - ${jobId}`);
 
-export const classificationWorker = new Worker<ClassificationJobPayload>(
-  QUEUE_NAMES.CLASSIFICATION,
-  async (job: BullJob<ClassificationJobPayload>) => {
-    const { jobId, companyName } = job.data;
-    logger.info(`Processing classification for ${companyName} - ${jobId}`);
-
+  try {
     // 1. Fetch Job from MongoDB
     const dbJob = await Job.findOne({ jobId, companyName });
     if (!dbJob) {
@@ -52,26 +44,14 @@ export const classificationWorker = new Worker<ClassificationJobPayload>(
     // 5. Trigger notifications for active early career jobs
     const earlyCareerCategories = ['internship', 'new_grad', 'entry_level', 'co_op', 'rotational'];
     if (!dbJob.isExpired && earlyCareerCategories.includes(result.classification)) {
-      const { addJobToNotificationQueue } = await import('../queues/notification.queue');
-      await addJobToNotificationQueue({
-        jobId: dbJob.jobId,
-        companyName: dbJob.companyName,
+      const { processNotificationJob } = await import('./notification.worker');
+      
+      // Execute asynchronously in the background
+      processNotificationJob(dbJob.jobId, dbJob.companyName).catch((err) => {
+        logger.error(`Notification dispatch failed for ${dbJob.companyName} - ${dbJob.jobId}:`, err);
       });
     }
-  },
-  {
-    connection: getRedisClient() as any,
-    concurrency: 5,
+  } catch (err: any) {
+    logger.error(`Classification job failed for ${companyName} - ${jobId}:`, err.message);
   }
-);
-
-classificationWorker.on('completed', (job) => {
-  logger.debug(`Classification job completed: ${job.id}`);
-});
-
-classificationWorker.on('failed', (job, err) => {
-  logger.error(
-    `Classification job failed for ${job?.data.companyName} - ${job?.data.jobId}:`,
-    err.message
-  );
-});
+}

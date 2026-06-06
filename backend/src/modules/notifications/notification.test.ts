@@ -11,16 +11,6 @@ import { Notification } from '../../models/Notification.model';
 import { generateAccessToken } from '../../utils/jwt';
 import { matchAlertsForJob } from '../alerts/alerts.matcher';
 
-vi.mock('bullmq', () => ({ Queue: vi.fn(), Worker: vi.fn() }));
-vi.mock('ioredis', () => {
-  class RedisMock {
-    on = vi.fn();
-    quit = vi.fn();
-    status = 'ready';
-  }
-  return { default: RedisMock, Redis: RedisMock };
-});
-vi.mock('typesense', () => ({ default: { Client: vi.fn() }, Client: vi.fn() }));
 vi.mock('@/services/channels/email.service', () => ({ emailService: { sendEmail: vi.fn() } }));
 vi.mock('@/services/channels/telegram.service', () => ({ telegramService: { sendMessage: vi.fn() } }));
 vi.mock('@/services/channels/discord.service', () => ({ discordService: { sendWebhook: vi.fn() } }));
