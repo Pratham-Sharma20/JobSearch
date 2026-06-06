@@ -99,10 +99,12 @@ export class CustomScraper extends BaseScraper {
     const browser = await chromium.launch({ headless: true });
     try {
       const page = await browser.newPage();
-      await page.goto('https://jobs.apple.com/en-us/search', { waitUntil: 'networkidle', timeout: 60000 });
+      // Specifically search for software roles
+      await page.goto('https://jobs.apple.com/en-us/search?search=Software&sort=relevance', { waitUntil: 'networkidle', timeout: 60000 });
       
+      await page.waitForSelector('a[id*="job-link"]', { timeout: 15000 }).catch(() => {});
       const jobCards = await page.$$('a[id*="job-link"]');
-      for (const card of jobCards.slice(0, 20)) {
+      for (const card of jobCards) {
         const title = await card.innerText();
         const url = await card.getAttribute('href');
         if (title && url) {
@@ -110,6 +112,7 @@ export class CustomScraper extends BaseScraper {
             title,
             location: 'Various',
             applyUrl: `https://jobs.apple.com${url}`,
+            jobId: url.split('/').pop() || undefined
           });
         }
       }
@@ -124,13 +127,14 @@ export class CustomScraper extends BaseScraper {
     const browser = await chromium.launch({ headless: true });
     try {
       const page = await browser.newPage();
-      await page.goto('https://careers.google.com/jobs/results/', { waitUntil: 'networkidle', timeout: 60000 });
+      // Search for software engineer roles
+      await page.goto('https://careers.google.com/jobs/results/?q=software%20engineer', { waitUntil: 'networkidle', timeout: 60000 });
       
       // Wait for job list container
-      await page.waitForSelector('a[data-gtm-ref="search-results"]', { timeout: 10000 }).catch(() => {});
+      await page.waitForSelector('a[data-gtm-ref="search-results"]', { timeout: 15000 }).catch(() => {});
       const jobCards = await page.$$('a[data-gtm-ref="search-results"]');
       
-      for (const card of jobCards.slice(0, 20)) {
+      for (const card of jobCards) {
         const titleEl = await card.$('h3');
         const title = titleEl ? await titleEl.innerText() : 'Google Role';
         const url = await card.getAttribute('href');
@@ -140,6 +144,7 @@ export class CustomScraper extends BaseScraper {
             title,
             location: 'Multiple Locations',
             applyUrl: `https://careers.google.com${url}`,
+            jobId: url.split('/').pop() || undefined
           });
         }
       }
@@ -154,10 +159,12 @@ export class CustomScraper extends BaseScraper {
     const browser = await chromium.launch({ headless: true });
     try {
       const page = await browser.newPage();
-      await page.goto('https://jobs.careers.microsoft.com/global/en/search', { waitUntil: 'networkidle', timeout: 60000 });
+      // Search for software engineer roles
+      await page.goto('https://jobs.careers.microsoft.com/global/en/search?q=software%20engineer', { waitUntil: 'networkidle', timeout: 60000 });
       
+      await page.waitForSelector('a[href*="/job/"]', { timeout: 15000 }).catch(() => {});
       const jobCards = await page.$$('a[href*="/job/"]');
-      for (const card of jobCards.slice(0, 20)) {
+      for (const card of jobCards) {
         const titleEl = await card.$('h2');
         const title = titleEl ? await titleEl.innerText() : await card.innerText();
         const url = await card.getAttribute('href');
@@ -167,6 +174,7 @@ export class CustomScraper extends BaseScraper {
             title: title.split('\n')[0],
             location: 'Multiple Locations',
             applyUrl: url.startsWith('http') ? url : `https://jobs.careers.microsoft.com${url}`,
+            jobId: url.split('/').pop() || undefined
           });
         }
       }

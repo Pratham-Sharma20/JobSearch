@@ -15,7 +15,7 @@ const companySchema = new Schema<ICompanyDocument>(
     },
     logoUrl: { type: String, required: true, trim: true },
     careerUrl: { type: String, required: true, trim: true },
-    earlyCareerUrl: { type: String, required: true, trim: true },
+    earlyCareerUrl: { type: String, trim: true },
     industry: { type: String, required: true, trim: true, index: true },
     atsPlatform: {
       type: String,

@@ -12,11 +12,11 @@ export enum ATSPlatform {
 
 export async function detectATS(url: string): Promise<ATSPlatform> {
   try {
-    if (url.includes('boards.greenhouse.io')) return ATSPlatform.GREENHOUSE;
-    if (url.includes('jobs.lever.co')) return ATSPlatform.LEVER;
-    if (url.includes('myworkdayjobs.com')) return ATSPlatform.WORKDAY;
+    if (url.includes('greenhouse.io')) return ATSPlatform.GREENHOUSE;
+    if (url.includes('lever.co')) return ATSPlatform.LEVER;
+    if (url.includes('myworkdayjobs.com') || url.includes('workday.com')) return ATSPlatform.WORKDAY;
     if (url.includes('icims.com')) return ATSPlatform.ICIMS;
-    if (url.includes('successfactors.com')) return ATSPlatform.SUCCESSFACTORS;
+    if (url.includes('successfactors.com') || url.includes('sap.com')) return ATSPlatform.SUCCESSFACTORS;
 
     // Fallback: Fetch the page and look for signatures
     const response = await axios.get(url, { timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' } });
