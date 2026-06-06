@@ -32,20 +32,24 @@ export class CustomScraper extends BaseScraper {
 
   private async scrapeAmazon(): Promise<RawJob[]> {
     const jobs: RawJob[] = [];
-    const queries = ['intern', 'new grad', 'entry level'];
+    const queries = ['Software Development Engineer', 'Software Engineer Intern'];
     
     try {
       for (const query of queries) {
-        const response = await axios.get(`https://www.amazon.jobs/en/search.json?base_query=${encodeURIComponent(query)}&offset=0&result_limit=50&sort=recent`);
+        const response = await axios.get(`https://www.amazon.jobs/en/search.json?base_query=${encodeURIComponent(query)}&offset=0&result_limit=100&sort=recent&category[]=software-development`, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+          }
+        });
         const data = response.data.jobs || [];
         for (const item of data) {
           jobs.push({
             jobId: item.id_icims || item.id,
             title: item.title,
             location: item.normalized_location || item.location,
-            description: item.description_short,
+            description: item.description_short || item.description,
             applyUrl: item.url_next_step ? (item.url_next_step.startsWith('http') ? item.url_next_step : `https://account.amazon.jobs${item.url_next_step}`) : `https://www.amazon.jobs${item.job_path}`,
-            updated_at: new Date().toISOString(), // Amazon gives strings like "14 minutes", just use current time to avoid Invalid Date
+            updated_at: item.posted_date || new Date().toISOString(),
           });
         }
       }
@@ -60,19 +64,27 @@ export class CustomScraper extends BaseScraper {
     const browser = await chromium.launch({ headless: true });
     try {
       const page = await browser.newPage();
-      await page.goto('https://www.metacareers.com/jobs', { waitUntil: 'networkidle', timeout: 60000 });
-      // Very basic extraction, relying on Meta's role list container
+      // Searching specifically for internships and software engineering roles
+      await page.goto('https://www.metacareers.com/jobs/?q=software%20engineer', { waitUntil: 'networkidle', timeout: 60000 });
+
+      // Wait for results to load
+      await page.waitForSelector('a[href*="/v2/jobs/"]', { timeout: 15000 }).catch(() => {});
+
       const jobCards = await page.$$('a[href*="/v2/jobs/"]');
-      for (const card of jobCards.slice(0, 20)) { // limit to top 20
+      for (const card of jobCards) {
         const titleEl = await card.$('div[role="heading"]');
         const title = titleEl ? await titleEl.innerText() : await card.innerText();
         const url = await card.getAttribute('href');
         
+        // Find location - often in a sibling or parent div
+        const location = 'Multiple Locations'; // Default
+
         if (title && url) {
           jobs.push({
-            title: title.split('\n')[0], // Clean up newlines if location is inside
-            location: 'Multiple Locations',
+            title: title.split('\n')[0],
+            location: location,
             applyUrl: `https://www.metacareers.com${url}`,
+            jobId: url.split('/').pop() || undefined
           });
         }
       }
